@@ -13,6 +13,47 @@ import random
 from tqdm import tqdm
 import argparse
 import cv2
+import math
+
+# Your NoisyLinear Implementation (with b_epsilon fix)
+class NoisyLinear(torch.nn.Module):
+    def __init__(self, in_features, out_features, std_init=0.5):
+        super(NoisyLinear, self).__init__()
+        self.in_features, self.out_features, self.std_init = in_features, out_features, std_init
+
+        self.w_mu = torch.nn.Parameter(torch.Tensor(out_features, in_features))
+        self.w_sigma = torch.nn.Parameter(torch.Tensor(out_features, in_features))
+        self.b_mu = torch.nn.Parameter(torch.Tensor(out_features))
+        self.b_sigma = torch.nn.Parameter(torch.Tensor(out_features))
+
+        self.register_buffer('w_epsilon', torch.Tensor(out_features, in_features))
+        self.register_buffer('b_epsilon', torch.Tensor(out_features))
+
+        self.init_parameters()
+        self.reset_noise()
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x,
+                                          self.w_mu + self.w_sigma * self.w_epsilon,
+                                          self.b_mu + self.b_sigma * self.b_epsilon)
+
+    def init_parameters(self):
+        mu_range = 1 / math.sqrt(self.in_features)
+        self.w_mu.data.uniform_(-mu_range, mu_range)
+        self.b_mu.data.uniform_(-mu_range, mu_range)
+
+        self.w_sigma.data.fill_(self.std_init / math.sqrt(self.in_features))
+        self.b_sigma.data.fill_(self.std_init / math.sqrt(self.out_features))
+
+    def _noise_func(self, size):
+        x = torch.randn(size)
+        return x.sign().mul(x.abs().sqrt())
+
+    def reset_noise(self):
+        in_epsilon = self._noise_func(self.in_features)
+        out_epsilon = self._noise_func(self.out_features)
+        self.w_epsilon.copy_(out_epsilon.ger(in_epsilon))
+        self.b_epsilon.copy_(self._noise_func(self.out_features))  # Fixed bug
 
 # Compatibility Wrapper for Old Gym API
 class ResetCompatibilityWrapper(Wrapper):
@@ -64,35 +105,10 @@ class ResizeObservation(Wrapper):
         return obs, reward, terminated, truncated, info
 
     def _resize_grayscale(self, obs):
-        # Resize (height, width, 3) to (new_height, new_width, 3)
         obs = cv2.resize(obs, self.shape[::-1], interpolation=cv2.INTER_AREA)
-        # Convert to grayscale
         obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-        # Add channel dimension: (height, width) -> (height, width, 1)
         obs = np.expand_dims(obs, axis=-1)
         return obs
-
-# Noisy Linear Layer for Noisy Nets
-class NoisyLinear(nn.Module):
-    def __init__(self, in_features, out_features, sigma_init=0.017):
-        super(NoisyLinear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight_mu = nn.Parameter(torch.Tensor(out_features, in_features))
-        self.weight_sigma = nn.Parameter(torch.Tensor(out_features, in_features))
-        self.bias_mu = nn.Parameter(torch.Tensor(out_features))
-        self.bias_sigma = nn.Parameter(torch.Tensor(out_features))
-        nn.init.xavier_uniform_(self.weight_mu)
-        nn.init.constant_(self.weight_sigma, sigma_init)
-        nn.init.uniform_(self.bias_mu, -0.1, 0.1)
-        nn.init.constant_(self.bias_sigma, sigma_init)
-
-    def forward(self, x):
-        weight_epsilon = torch.randn_like(self.weight_sigma)
-        bias_epsilon = torch.randn_like(self.bias_sigma)
-        noisy_weight = self.weight_mu + self.weight_sigma * weight_epsilon
-        noisy_bias = self.bias_mu + self.bias_sigma * bias_epsilon
-        return torch.nn.functional.linear(x, noisy_weight, noisy_bias)
 
 # Dueling Categorical DQN
 class DuelingCategoricalDQN(nn.Module):
@@ -112,14 +128,14 @@ class DuelingCategoricalDQN(nn.Module):
         )
         conv_out_size = self._get_conv_out(input_shape)
         self.fc_value = nn.Sequential(
-            NoisyLinear(conv_out_size, 512),
+            NoisyLinear(conv_out_size, 512, std_init=0.5),
             nn.ReLU(),
-            NoisyLinear(512, num_atoms)
+            NoisyLinear(512, num_atoms, std_init=0.5)
         )
         self.fc_advantage = nn.Sequential(
-            NoisyLinear(conv_out_size, 512),
+            NoisyLinear(conv_out_size, 512, std_init=0.5),
             nn.ReLU(),
-            NoisyLinear(512, num_actions * num_atoms)
+            NoisyLinear(512, num_actions * num_atoms, std_init=0.5)
         )
 
     def _get_conv_out(self, shape):
@@ -213,6 +229,10 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
     # Main training loop
     with tqdm(range(args.num_episodes), desc="Training Episodes", unit="episode") as pbar:
         for episode in pbar:
+            # Reset noise for all NoisyLinear layers
+            for module in policy_net.modules():
+                if isinstance(module, NoisyLinear):
+                    module.reset_noise()
             state, info = env.reset()
             state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
             episode_reward = 0
@@ -246,7 +266,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
 
                     with torch.no_grad():
                         next_probs = target_net(next_states)
-                        next_q = (next_probs * z).sum(dim=-1)
+                        next_q = (probs * z).sum(dim=-1)
                         next_action = next_q.argmax(dim=1)
                         target_probs = next_probs[range(batch_size), next_action]
                         target_z = rewards.unsqueeze(1) + (gamma ** n_step) * z.unsqueeze(0) * (1 - dones).unsqueeze(1)
@@ -262,7 +282,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                         u_clamped = u.clamp(0, num_atoms - 1)
                         m_flat = m.view(-1)
 
-                        # Explicitly cast indices to long and ensure source is float
+                        # Explicitly cast indices and source
                         l_indices = (l_clamped + offset).view(-1).long()
                         u_indices = (u_clamped + offset).view(-1).long()
                         l_source = (target_probs * (u.float() - b)).view(-1).float()
@@ -307,6 +327,10 @@ def evaluate_agent(env, policy_net, args):
     z = torch.linspace(V_min, V_max, num_atoms).to(device)
 
     for episode in tqdm(range(args.num_eval_episodes), desc="Evaluation Episodes"):
+        # Reset noise for evaluation
+        for module in policy_net.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_noise()
         state, info = env.reset()
         state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
         total_reward = 0
