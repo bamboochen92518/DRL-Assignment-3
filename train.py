@@ -242,8 +242,8 @@ def get_beta(step, total_steps, beta_start=0.4, beta_end=1.0):
     fraction = min(1.0, step / total_steps)
     return beta_start + fraction * (beta_end - beta_start)
 
-# train_rainbow_dqn (unchanged)
-def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
+# train_rainbow_dqn (modified)
+def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=0, start_episode=0, warmup_done=False):
     num_actions = env.action_space.n
     num_atoms = args.num_atoms
     V_min = args.V_min
@@ -257,7 +257,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
     delta_z = (V_max - V_min) / (num_atoms - 1)
     z = torch.linspace(V_min, V_max, num_atoms).to(device)
     history_rewards = []
-    steps_done = 0
+    steps_done = start_steps
     epsilon_start = 1.0
     epsilon_end = 0.1
     epsilon_decay = args.total_steps // 2
@@ -266,29 +266,32 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
         fraction = min(1.0, step / epsilon_decay)
         return epsilon_start + fraction * (epsilon_end - epsilon_start)
 
-    # Warmup phase
-    print("Starting warmup phase...")
-    state, info = env.reset()
-    state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0
-    with tqdm(total=warmup_steps, desc="Warmup Steps") as pbar:
-        while steps_done < warmup_steps:
-            action = env.action_space.sample()
-            next_state, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device) / 255.0
-            reward = reward
-            gamma_val = 0.0 if done else gamma
-            memory.push(state.cpu().numpy(), action, next_state.cpu().numpy(), reward, done, gamma_val)
-            state = next_state
-            steps_done += 1
-            pbar.update(1)
-            if done:
-                state, info = env.reset()
-                state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0
-    print("Warmup phase completed.")
+    # Warmup phase (skip if already done)
+    if not warmup_done:
+        print("Starting warmup phase...")
+        state, info = env.reset()
+        state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0
+        with tqdm(total=warmup_steps, desc="Warmup Steps") as pbar:
+            while steps_done < warmup_steps:
+                action = env.action_space.sample()
+                next_state, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+                next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device) / 255.0
+                reward = reward
+                gamma_val = 0.0 if done else gamma
+                memory.push(state.cpu().numpy(), action, next_state.cpu().numpy(), reward, done, gamma_val)
+                state = next_state
+                steps_done += 1
+                pbar.update(1)
+                if done:
+                    state, info = env.reset()
+                    state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0
+        print("Warmup phase completed.")
+    else:
+        print("Warmup phase skipped (loaded from checkpoint).")
 
     # Main training loop
-    with tqdm(range(args.num_episodes), desc="Training Episodes", unit="episode") as pbar:
+    with tqdm(range(start_episode, args.num_episodes), desc="Training Episodes", unit="episode") as pbar:
         for episode in pbar:
             for module in policy_net.modules():
                 if isinstance(module, NoisyLinear):
@@ -370,7 +373,13 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                 print(f"Episode {episode + 1}/{args.num_episodes}, Avg Reward (last 100): {avg_reward:.2f}")
                 try:
                     os.makedirs("checkpoints", exist_ok=True)
-                    torch.save(policy_net.state_dict(), f"checkpoints/checkpoint_episode_{episode + 1}.pth")
+                    checkpoint = {
+                        'state_dict': policy_net.state_dict(),
+                        'steps_done': steps_done,
+                        'episode': episode,
+                        'warmup_done': steps_done >= warmup_steps
+                    }
+                    torch.save(checkpoint, f"checkpoints/checkpoint_episode_{episode + 1}.pth")
                 except Exception as e:
                     print(f"Error saving checkpoint: {e}")
                 evaluate_agent(env, policy_net, args)
@@ -405,12 +414,17 @@ def evaluate_agent(env, policy_net, args):
             total_reward += reward
         print(f"Evaluation Episode {episode + 1}, Reward: {total_reward:.2f}, x_pos: {info.get('x_pos', 0)}, coins: {info.get('coins', 0)}, time: {info.get('time', 400)}, flag_get: {info.get('flag_get', False)}")
 
-# load_checkpoint (new)
+# load_checkpoint (modified)
 def load_checkpoint(model, checkpoint_path, device):
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint)
+        model.load_state_dict(checkpoint['state_dict'])
+        steps_done = checkpoint.get('steps_done', 0)
+        episode = checkpoint.get('episode', 0)
+        warmup_done = checkpoint.get('warmup_done', False)
         print(f"Loaded checkpoint from {checkpoint_path}")
+        print(f"Resuming from Episode {episode + 1}, Steps Done: {steps_done}, Warmup Done: {warmup_done}")
+        return steps_done, episode, warmup_done
     except FileNotFoundError:
         print(f"Checkpoint file {checkpoint_path} not found.")
         raise
@@ -471,8 +485,11 @@ def main():
     target_net = DuelingCategoricalDQN((4, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
 
     # Load checkpoint if provided
+    start_steps = 0
+    start_episode = 0
+    warmup_done = False
     if args.checkpoint_path:
-        load_checkpoint(policy_net, args.checkpoint_path, device)
+        start_steps, start_episode, warmup_done = load_checkpoint(policy_net, args.checkpoint_path, device)
 
     target_net.load_state_dict(policy_net.state_dict())
     optimizer = optim.Adam(policy_net.parameters(), lr=args.lr, eps=args.eps)
@@ -480,7 +497,7 @@ def main():
 
     # Train the model
     print("Starting training...")
-    policy_net = train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args)
+    policy_net = train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=start_steps, start_episode=start_episode, warmup_done=warmup_done)
     print("Training completed.")
 
     # Final evaluation
