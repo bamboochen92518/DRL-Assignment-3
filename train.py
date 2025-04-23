@@ -453,7 +453,7 @@ def main():
     parser.add_argument("--resize_shape", type=int, default=84, help="Size for resizing observations")
     parser.add_argument("--total_steps", type=int, default=10000000, help="Total steps for beta annealing")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to checkpoint file to load (optional)")
-    parser.add_argument("--checkpoint_interval", type=int, default=100, help="Interval (in episodes) to save checkpoints and evaluate")
+    parser.add_argument("--checkpoint_interval", type=int, default=10, help="Interval (in episodes) to save checkpoints and evaluate")
     args = parser.parse_args()
 
     # Validate arguments
