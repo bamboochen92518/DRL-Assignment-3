@@ -157,7 +157,7 @@ class ActionRepeatWrapper(Wrapper):
         self.step_count = 0
         return self.env.reset(**kwargs)
 
-# ResetCompatibilityWrapper (modified to keep grayscale)
+# ResetCompatibilityWrapper (unchanged)
 class ResetCompatibilityWrapper(Wrapper):
     def reset(self, **kwargs):
         result = self.env.reset(**kwargs)
@@ -166,12 +166,10 @@ class ResetCompatibilityWrapper(Wrapper):
         else:
             obs, info = result, {}
         obs = np.array(obs, dtype=np.uint8)
-        # Remove alpha channel if present, but don't convert grayscale to RGB
         if len(obs.shape) == 3 and obs.shape[-1] == 4:
-            obs = obs[..., :3]  # RGBA -> RGB (temporary, will be converted to grayscale later)
-        # Ensure the observation is in (height, width, channels) format
+            obs = obs[..., :3]
         if len(obs.shape) == 2:
-            obs = np.expand_dims(obs, axis=-1)  # (height, width) -> (height, width, 1)
+            obs = np.expand_dims(obs, axis=-1)
         if isinstance(self.env, (FrameStack, CustomFrameStack)):
             return obs
         return obs, info
@@ -182,19 +180,19 @@ class ResetCompatibilityWrapper(Wrapper):
             obs, reward, done, info = result
             obs = np.array(obs, dtype=np.uint8)
             if len(obs.shape) == 3 and obs.shape[-1] == 4:
-                obs = obs[..., :3]  # RGBA -> RGB (temporary, will be converted to grayscale later)
+                obs = obs[..., :3]
             if len(obs.shape) == 2:
-                obs = np.expand_dims(obs, axis=-1)  # (height, width) -> (height, width, 1)
+                obs = np.expand_dims(obs, axis=-1)
             return obs, reward, done, False, info
         obs, reward, terminated, truncated, info = result
         obs = np.array(obs, dtype=np.uint8)
         if len(obs.shape) == 3 and obs.shape[-1] == 4:
-            obs = obs[..., :3]  # RGBA -> RGB (temporary, will be converted to grayscale later)
+            obs = obs[..., :3]
         if len(obs.shape) == 2:
-            obs = np.expand_dims(obs, axis=-1)  # (height, width) -> (height, width, 1)
+            obs = np.expand_dims(obs, axis=-1)
         return obs, reward, terminated, truncated, info
 
-# CustomFrameStack (modified to handle grayscale)
+# CustomFrameStack (unchanged)
 class CustomFrameStack(Wrapper):
     def __init__(self, env, num_stack=4):
         super().__init__(env)
@@ -209,8 +207,7 @@ class CustomFrameStack(Wrapper):
         else:
             obs, info = result, {}
         obs = np.array(obs, dtype=np.uint8)
-        # Ensure grayscale (1 channel)
-        if obs.shape[-1] == 3:  # If RGB, convert to grayscale
+        if obs.shape[-1] == 3:
             obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
             obs = np.expand_dims(obs, axis=-1)
         self.frames = [obs] * self.num_stack
@@ -220,15 +217,14 @@ class CustomFrameStack(Wrapper):
         result = self.env.step(action)
         obs, reward, terminated, truncated, info = result
         obs = np.array(obs, dtype=np.uint8)
-        # Ensure grayscale (1 channel)
-        if obs.shape[-1] == 3:  # If RGB, convert to grayscale
+        if obs.shape[-1] == 3:
             obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
             obs = np.expand_dims(obs, axis=-1)
         self.frames.pop(0)
         self.frames.append(obs)
         return np.stack(self.frames, axis=0), reward, terminated, truncated, info
 
-# ResizeObservation (unchanged, already outputs grayscale)
+# ResizeObservation (unchanged)
 class ResizeObservation(Wrapper):
     def __init__(self, env, shape):
         super().__init__(env)
@@ -246,13 +242,12 @@ class ResizeObservation(Wrapper):
 
     def _resize_grayscale(self, obs):
         obs = cv2.resize(obs, self.shape[::-1], interpolation=cv2.INTER_AREA)
-        # If obs is RGB, convert to grayscale
         if len(obs.shape) == 3 and obs.shape[-1] == 3:
             obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
             obs = np.expand_dims(obs, axis=-1)
         return obs
 
-# DuelingCategoricalDQN (modified for grayscale input)
+# DuelingCategoricalDQN (modified to handle input shape correctly)
 class DuelingCategoricalDQN(nn.Module):
     def __init__(self, input_shape, num_actions=12, num_atoms=51, V_min=-10, V_max=10, std_init=0.5):
         super(DuelingCategoricalDQN, self).__init__()
@@ -260,9 +255,10 @@ class DuelingCategoricalDQN(nn.Module):
         self.num_atoms = num_atoms
         self.V_min = V_min
         self.V_max = V_max
-        # Input shape is (num_stack, height, width, 1) for grayscale
+        self.num_stack = input_shape[0]  # Number of stacked frames
+        self.channels = input_shape[-1]  # Number of channels per frame (1 for grayscale)
         self.conv = nn.Sequential(
-            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),  # input_shape[0] = num_stack * channels, channels=1
+            nn.Conv2d(self.num_stack * self.channels, 32, kernel_size=8, stride=4),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
@@ -282,11 +278,19 @@ class DuelingCategoricalDQN(nn.Module):
         )
 
     def _get_conv_out(self, shape):
-        o = self.conv(torch.zeros(1, *shape))
+        # Shape is (num_stack, height, width, channels)
+        # Reshape to (batch_size, num_stack * channels, height, width)
+        num_stack, height, width, channels = shape
+        dummy_input = torch.zeros(1, num_stack, height, width, channels)
+        dummy_input = dummy_input.view(1, num_stack * channels, height, width)
+        o = self.conv(dummy_input)
         return int(np.prod(o.size()))
 
     def forward(self, x):
+        # x shape: (batch_size, num_stack, height, width, channels)
         batch_size = x.size(0)
+        # Reshape to (batch_size, num_stack * channels, height, width)
+        x = x.view(batch_size, self.num_stack * self.channels, x.size(2), x.size(3))
         conv_out = self.conv(x).view(batch_size, -1)
         value = self.fc_value(conv_out).view(batch_size, 1, self.num_atoms)
         advantage = self.fc_advantage(conv_out).view(batch_size, self.num_actions, self.num_atoms)
@@ -399,13 +403,11 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                 steps_done += 1
 
                 if len(memory) >= batch_size and steps_done % 4 == 0:
-                    # Sample using SumTree
                     batch_idx, batch_seq_data, sampling_weight = memory.sample(batch_size, n_step)
                     bias_max_weight = (len(memory) * memory.min_priority) ** (-get_beta(steps_done, args.total_steps))
                     bias_weight = (len(memory) * np.array(sampling_weight)) ** (-get_beta(steps_done, args.total_steps))
                     weights = torch.tensor(bias_weight / bias_max_weight, dtype=torch.float32, device=device)
 
-                    # Process batch data for n-step learning
                     batch_data = []
                     for seq_data in batch_seq_data:
                         data = list(seq_data.pop(0))
@@ -586,7 +588,6 @@ def main():
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Gradient clipping norm")
     args = parser.parse_args()
 
-    # Validate arguments
     if args.resize_shape <= 0:
         raise ValueError("resize_shape must be a positive integer")
     if args.checkpoint_interval <= 0:
@@ -604,7 +605,6 @@ def main():
     if args.grad_clip_norm <= 0:
         raise ValueError("grad_clip_norm must be a positive float")
 
-    # Set up environment
     env = gym_super_mario_bros.make('SuperMarioBros-1-1-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     env = ResetCompatibilityWrapper(env)
@@ -612,11 +612,9 @@ def main():
     env = CustomFrameStack(env, num_stack=args.num_stack)
     env = ActionRepeatWrapper(env, repeat=args.repeat)
 
-    # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Debug reset output
     result = env.reset()
     if isinstance(result, tuple):
         obs, info = result
@@ -625,12 +623,9 @@ def main():
     else:
         print(f"env.reset() output: {type(result)}, shape={result.shape}, dtype={result.dtype}")
 
-    # Initialize networks
-    # Input shape is (num_stack, height, width, 1) for grayscale
     policy_net = DuelingCategoricalDQN((args.num_stack, args.resize_shape, args.resize_shape, 1), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max, std_init=args.std_init).to(device)
     target_net = DuelingCategoricalDQN((args.num_stack, args.resize_shape, args.resize_shape, 1), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max, std_init=args.std_init).to(device)
 
-    # Load checkpoint if provided
     start_steps = 0
     start_episode = 0
     warmup_done = False
@@ -641,12 +636,10 @@ def main():
     optimizer = optim.Adam(policy_net.parameters(), lr=args.lr, eps=args.eps)
     memory = SumTree(capacity=args.memory_capacity)
 
-    # Train the model
     print("Starting training...")
     policy_net, steps_done = train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=start_steps, start_episode=start_episode, warmup_done=warmup_done)
     print("Training completed.")
 
-    # Final evaluation
     print("Evaluating final model...")
     evaluate_agent(env, policy_net, args, args.num_episodes, steps_done)
     env.close()
