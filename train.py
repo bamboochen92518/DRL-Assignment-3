@@ -298,7 +298,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                         next_q = torch.sum(next_probs * z, dim=-1)
                         next_action = next_q.argmax(dim=1)
                         target_probs = next_probs[range(batch_size), next_action]
-                        target_z = rewards.unsqueeze(1) + (gamma ** n_step) * z.unsqueeze(0) * (1 - d
+                        target_z = rewards.unsqueeze(1) + (gamma ** n_step) * z.unsqueeze(0) * (1 - dones).unsqueeze(1)
                         target_z = target_z.clamp(V_min, V_max)
                         b = (target_z - V_min) / delta_z
                         l = b.floor().long()
