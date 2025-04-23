@@ -375,7 +375,7 @@ def evaluate_agent(env, policy_net, args):
 def main():
     parser = argparse.ArgumentParser(description="Rainbow DQN for Super Mario Bros")
     parser.add_argument("--num_episodes", type=int, default=1000, help="Number of training episodes")
-    parser.add_argument("--warmup_steps", type=int, default=800, help="Number of warmup steps")
+    parser.add_argument("--warmup_steps", type=int, default=80000, help="Number of warmup steps")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--n_step", type=int, default=3, help="N-step return")
