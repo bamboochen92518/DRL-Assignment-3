@@ -16,7 +16,7 @@ import cv2
 import math
 from gym.wrappers import FrameStack
 
-# SumTree (from provided code)
+# SumTree (unchanged)
 class SumTree:
     def __init__(self, capacity):
         self.capacity = 1
@@ -242,7 +242,7 @@ class ResizeObservation(Wrapper):
         obs = np.expand_dims(obs, axis=-1)
         return obs
 
-# DuelingCategoricalDQN (modified to add zero_noise)
+# DuelingCategoricalDQN (unchanged)
 class DuelingCategoricalDQN(nn.Module):
     def __init__(self, input_shape, num_actions=12, num_atoms=51, V_min=-10, V_max=10, std_init=0.5):
         super(DuelingCategoricalDQN, self).__init__()
@@ -293,13 +293,15 @@ class DuelingCategoricalDQN(nn.Module):
                 module.w_epsilon.zero_()
                 module.b_epsilon.zero_()
 
-# Transition and stack_data (for compatibility with SumTree)
+# Transition and stack_data (unchanged)
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done', 'gamma'))
 
 def stack_data(batch_data, device='cpu'):
     assert isinstance(batch_data, (list, tuple))
     if isinstance(batch_data[0], torch.Tensor):
         return torch.stack(batch_data).to(device)
+    elif isinstance(batch_data[0], np.ndarray):
+        return torch.from_numpy(np.array(batch_data)).to(device)
     else:
         return torch.tensor(batch_data).to(device)
 
@@ -308,7 +310,7 @@ def get_beta(step, total_steps, beta_start=0.4, beta_end=1.0):
     fraction = min(1.0, step / total_steps)
     return beta_start + fraction * (beta_end - beta_start)
 
-# train_rainbow_dqn (modified for gradient clipping and SumTree)
+# train_rainbow_dqn (fixed gammas definition)
 def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=0, start_episode=0, warmup_done=False):
     num_actions = env.action_space.n
     num_atoms = args.num_atoms
@@ -371,7 +373,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                 else:
                     with torch.no_grad():
                         state_batched = state.unsqueeze(0)
-                        with torch.cuda.amp.autocast() if device.type == "cuda" else torch.no_grad():
+                        with torch.amp.autocast('cuda') if device.type == "cuda" else torch.no_grad():
                             probs = policy_net(state_batched)
                             q_values = (probs * z).sum(dim=-1)
                         action = q_values.argmax(dim=1).item()
@@ -411,12 +413,12 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                     n_steps = [data[5] for data in batch_data]
 
                     with torch.no_grad():
-                        with torch.cuda.amp.autocast() if device.type == "cuda" else torch.no_grad():
+                        with torch.amp.autocast('cuda') if device.type == "cuda" else torch.no_grad():
                             gammas = stack_data([gamma ** n for n in n_steps], device)
                             next_probs = target_net(next_states)
                             next_q = (next_probs * z).sum(dim=-1)
                             next_action = next_q.argmax(dim=1)
-                            target_probs = next_probs[range(batch_size), next_action]
+                            target_probs = (next_probs)[range(batch_size), next_action]
                             target_z = rewards.unsqueeze(1) + (1 - dones.unsqueeze(1)) * gammas.unsqueeze(1) * z.unsqueeze(0)
                             target_z = target_z.clamp(V_min, V_max)
                             b = (target_z - V_min) / delta_z
@@ -435,7 +437,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                             m_flat.index_add_(0, l_indices, l_source)
                             m_flat.index_add_(0, u_indices, u_source)
 
-                    with torch.cuda.amp.autocast() if device.type == "cuda" else torch.no_grad():
+                    with torch.amp.autocast('cuda') if device.type == "cuda" else torch.no_grad():
                         probs = policy_net(states)[range(batch_size), actions]
                         loss = -(m * torch.log(probs + 1e-10)).sum(dim=-1)
                         weighted_loss = weights * loss
@@ -476,9 +478,9 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                     print(f"Error saving checkpoint: {e}")
                 evaluate_agent(env, policy_net, args, episode, steps_done)
 
-    return policy_net
+    return policy_net, steps_done
 
-# evaluate_agent (modified for 10 episodes, checkpoint saving, and avg reward only)
+# evaluate_agent (unchanged)
 def evaluate_agent(env, policy_net, args, episode, steps_done):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_atoms = args.num_atoms
@@ -491,7 +493,7 @@ def evaluate_agent(env, policy_net, args, episode, steps_done):
     num_episodes = 10
 
     for ep in tqdm(range(num_episodes), desc="Evaluation Episodes"):
-        policy_net.zero_noise()  # Use zero_noise during evaluation
+        policy_net.zero_noise()
         state, info = env.reset()
         state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0
         episode_reward = 0
@@ -499,7 +501,7 @@ def evaluate_agent(env, policy_net, args, episode, steps_done):
         while not done:
             with torch.no_grad():
                 state_batched = state.unsqueeze(0)
-                with torch.cuda.amp.autocast() if device.type == "cuda" else torch.no_grad():
+                with torch.amp.autocast('cuda') if device.type == "cuda" else torch.no_grad():
                     probs = policy_net(state_batched)
                     q_values = (probs * z).sum(dim=-1)
                 action = q_values.argmax(dim=1).item()
@@ -545,7 +547,7 @@ def load_checkpoint(model, checkpoint_path, device):
         print(f"Error loading checkpoint: {e}")
         raise
 
-# main (modified to add grad_clip_norm)
+# main (unchanged)
 def main():
     parser = argparse.ArgumentParser(description="Rainbow DQN for Super Mario Bros")
     parser.add_argument("--num_episodes", type=int, default=1000, help="Number of training episodes")
@@ -629,7 +631,7 @@ def main():
 
     # Train the model
     print("Starting training...")
-    policy_net = train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=start_steps, start_episode=start_episode, warmup_done=warmup_done)
+    policy_net, steps_done = train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=start_steps, start_episode=start_episode, warmup_done=warmup_done)
     print("Training completed.")
 
     # Final evaluation
