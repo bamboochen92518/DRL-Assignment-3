@@ -108,13 +108,13 @@ class ResetCompatibilityWrapper(Wrapper):
             obs = np.stack([obs] * 3, axis=-1)
         return obs, reward, terminated, truncated, info
 
-# CustomFrameStack (modified)
+# CustomFrameStack (unchanged)
 class CustomFrameStack(Wrapper):
     def __init__(self, env, num_stack=4):
         super().__init__(env)
         self.num_stack = num_stack
         self.frames = [None] * num_stack
-        self.lz4_compress = False  # Disable compression flag
+        self.lz4_compress = False
 
     def reset(self, **kwargs):
         result = self.env.reset(**kwargs)
@@ -198,7 +198,7 @@ class DuelingCategoricalDQN(nn.Module):
         probs = value + (advantage - advantage.mean(dim=1, keepdim=True))
         return torch.softmax(probs, dim=-1)
 
-# PrioritizedReplayBuffer (modified)
+# PrioritizedReplayBuffer (unchanged)
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'done', 'gamma'))
 
 class PrioritizedReplayBuffer:
@@ -261,7 +261,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
     epsilon_start = 1.0
     epsilon_end = 0.1
     epsilon_decay = args.total_steps // 2
-    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
     def get_epsilon(step):
         fraction = min(1.0, step / epsilon_decay)
@@ -441,7 +441,7 @@ def load_checkpoint(model, checkpoint_path, device):
         print(f"Error loading checkpoint: {e}")
         raise
 
-# main (unchanged)
+# main (modified)
 def main():
     parser = argparse.ArgumentParser(description="Rainbow DQN for Super Mario Bros")
     parser.add_argument("--num_episodes", type=int, default=1000, help="Number of training episodes")
@@ -464,6 +464,8 @@ def main():
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to checkpoint file to load (optional)")
     parser.add_argument("--checkpoint_interval", type=int, default=100, help="Interval (in episodes) to save checkpoints and evaluate")
     parser.add_argument("--std_init", type=float, default=0.5, help="Initial standard deviation for NoisyLinear layers")
+    parser.add_argument("--num_stack", type=int, default=3, help="Number of frames to stack in CustomFrameStack")
+    parser.add_argument("--repeat", type=int, default=4, help="Number of action repeats in ActionRepeatWrapper")
     args = parser.parse_args()
 
     # Validate arguments
@@ -477,14 +479,18 @@ def main():
         raise ValueError("batch_size must be a positive integer")
     if args.std_init <= 0:
         raise ValueError("std_init must be a positive float")
+    if args.num_stack <= 0:
+        raise ValueError("num_stack must be a positive integer")
+    if args.repeat <= 0:
+        raise ValueError("repeat must be a positive integer")
 
     # Set up environment
     env = gym_super_mario_bros.make('SuperMarioBros-1-1-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     env = ResetCompatibilityWrapper(env)
     env = ResizeObservation(env, shape=(args.resize_shape, args.resize_shape))
-    env = CustomFrameStack(env, num_stack=4)
-    env = ActionRepeatWrapper(env, repeat=4)
+    env = CustomFrameStack(env, num_stack=args.num_stack)
+    env = ActionRepeatWrapper(env, repeat=args.repeat)
 
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -500,8 +506,8 @@ def main():
         print(f"env.reset() output: {type(result)}, shape={result.shape}, dtype={result.dtype}")
 
     # Initialize networks
-    policy_net = DuelingCategoricalDQN((4, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max, std_init=args.std_init).to(device)
-    target_net = DuelingCategoricalDQN((4, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max, std_init=args.std_init).to(device)
+    policy_net = DuelingCategoricalDQN((args.num_stack, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max, std_init=args.std_init).to(device)
+    target_net = DuelingCategoricalDQN((args.num_stack, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max, std_init=args.std_init).to(device)
 
     # Load checkpoint if provided
     start_steps = 0
