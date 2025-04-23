@@ -247,16 +247,17 @@ class ResizeObservation(Wrapper):
             obs = np.expand_dims(obs, axis=-1)
         return obs
 
-# DuelingCategoricalDQN (modified to handle input shape correctly)
-class DuelingCategoricalDQN(nn.Module):
-    def __init__(self, input_shape, num_actions=12, num_atoms=51, V_min=-10, V_max=10, std_init=0.5):
-        super(DuelingCategoricalDQN, self).__init__()
+# DuelingCategoricalDQN (modified to support disabling dueling)
+class CategoricalDQN(nn.Module):
+    def __init__(self, input_shape, num_actions=12, num_atoms=51, V_min=-10, V_max=10, std_init=0.5, use_dueling=False):
+        super(CategoricalDQN, self).__init__()
         self.num_actions = num_actions
         self.num_atoms = num_atoms
         self.V_min = V_min
         self.V_max = V_max
-        self.num_stack = input_shape[0]  # Number of stacked frames
-        self.channels = input_shape[-1]  # Number of channels per frame (1 for grayscale)
+        self.use_dueling = use_dueling
+        self.num_stack = input_shape[0]
+        self.channels = input_shape[-1]
         self.conv = nn.Sequential(
             nn.Conv2d(self.num_stack * self.channels, 32, kernel_size=8, stride=4),
             nn.ReLU(),
@@ -266,20 +267,26 @@ class DuelingCategoricalDQN(nn.Module):
             nn.ReLU()
         )
         conv_out_size = self._get_conv_out(input_shape)
-        self.fc_value = nn.Sequential(
-            NoisyLinear(conv_out_size, 512, std_init=std_init),
-            nn.ReLU(),
-            NoisyLinear(512, num_atoms, std_init=std_init)
-        )
-        self.fc_advantage = nn.Sequential(
-            NoisyLinear(conv_out_size, 512, std_init=std_init),
-            nn.ReLU(),
-            NoisyLinear(512, num_actions * num_atoms, std_init=std_init)
-        )
+        
+        if self.use_dueling:
+            self.fc_value = nn.Sequential(
+                NoisyLinear(conv_out_size, 512, std_init=std_init),
+                nn.ReLU(),
+                NoisyLinear(512, num_atoms, std_init=std_init)
+            )
+            self.fc_advantage = nn.Sequential(
+                NoisyLinear(conv_out_size, 512, std_init=std_init),
+                nn.ReLU(),
+                NoisyLinear(512, num_actions * num_atoms, std_init=std_init)
+            )
+        else:
+            self.fc = nn.Sequential(
+                NoisyLinear(conv_out_size, 512, std_init=std_init),
+                nn.ReLU(),
+                NoisyLinear(512, num_actions * num_atoms, std_init=std_init)
+            )
 
     def _get_conv_out(self, shape):
-        # Shape is (num_stack, height, width, channels)
-        # Reshape to (batch_size, num_stack * channels, height, width)
         num_stack, height, width, channels = shape
         dummy_input = torch.zeros(1, num_stack, height, width, channels)
         dummy_input = dummy_input.view(1, num_stack * channels, height, width)
@@ -287,14 +294,15 @@ class DuelingCategoricalDQN(nn.Module):
         return int(np.prod(o.size()))
 
     def forward(self, x):
-        # x shape: (batch_size, num_stack, height, width, channels)
         batch_size = x.size(0)
-        # Reshape to (batch_size, num_stack * channels, height, width)
         x = x.view(batch_size, self.num_stack * self.channels, x.size(2), x.size(3))
         conv_out = self.conv(x).view(batch_size, -1)
-        value = self.fc_value(conv_out).view(batch_size, 1, self.num_atoms)
-        advantage = self.fc_advantage(conv_out).view(batch_size, self.num_actions, self.num_atoms)
-        probs = value + (advantage - advantage.mean(dim=1, keepdim=True))
+        if self.use_dueling:
+            value = self.fc_value(conv_out).view(batch_size, 1, self.num_atoms)
+            advantage = self.fc_advantage(conv_out).view(batch_size, self.num_actions, self.num_atoms)
+            probs = value + (advantage - advantage.mean(dim=1, keepdim=True))
+        else:
+            probs = self.fc(conv_out).view(batch_size, self.num_actions, self.num_atoms)
         return torch.softmax(probs, dim=-1)
 
     def reset_noise(self):
@@ -325,7 +333,7 @@ def get_beta(step, total_steps, beta_start=0.4, beta_end=1.0):
     fraction = min(1.0, step / total_steps)
     return beta_start + fraction * (beta_end - beta_start)
 
-# train_rainbow_dqn (unchanged)
+# train_rainbow_dqn (modified to support disabling Double DQN)
 def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=0, start_episode=0, warmup_done=False):
     num_actions = env.action_space.n
     num_atoms = args.num_atoms
@@ -336,6 +344,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
     n_step = args.n_step
     target_update = args.target_update
     warmup_steps = args.warmup_steps
+    use_double_dqn = args.use_double_dqn
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     delta_z = (V_max - V_min) / (num_atoms - 1)
     z = torch.linspace(V_min, V_max, num_atoms).to(device)
@@ -428,7 +437,10 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                     with torch.no_grad():
                         with torch.amp.autocast('cuda') if device.type == "cuda" else torch.no_grad():
                             gammas = stack_data([gamma ** n for n in n_steps], device)
-                            next_probs = target_net(next_states)
+                            if use_double_dqn:
+                                next_probs = target_net(next_states)
+                            else:
+                                next_probs = policy_net(next_states)
                             next_q = (next_probs * z).sum(dim=-1)
                             next_action = next_q.argmax(dim=1)
                             target_probs = (next_probs)[range(batch_size), next_action]
@@ -470,7 +482,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                     for idx, priority in zip(batch_idx, priorities):
                         memory.update_priority(idx, (priority ** args.alpha).item())
 
-                if steps_done % target_update == 0:
+                if use_double_dqn and steps_done % target_update == 0:
                     target_net.load_state_dict(policy_net.state_dict())
 
             history_rewards.append(episode_reward)
@@ -493,7 +505,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
 
     return policy_net, steps_done
 
-# evaluate_agent (unchanged)
+# evaluate_agent (modified to support disabling Double DQN)
 def evaluate_agent(env, policy_net, args, episode, steps_done):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_atoms = args.num_atoms
@@ -560,7 +572,7 @@ def load_checkpoint(model, checkpoint_path, device):
         print(f"Error loading checkpoint: {e}")
         raise
 
-# main (unchanged)
+# main (modified to add new arguments)
 def main():
     parser = argparse.ArgumentParser(description="Rainbow DQN for Super Mario Bros")
     parser.add_argument("--num_episodes", type=int, default=1000, help="Number of training episodes")
@@ -586,6 +598,8 @@ def main():
     parser.add_argument("--num_stack", type=int, default=4, help="Number of frames to stack in CustomFrameStack")
     parser.add_argument("--repeat", type=int, default=4, help="Number of action repeats in ActionRepeatWrapper")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Gradient clipping norm")
+    parser.add_argument("--use_double_dqn", action="store_true", default=False, help="Use Double DQN (default: False to save memory)")
+    parser.add_argument("--use_dueling", action="store_true", default=False, help="Use Dueling Networks (default: False to save memory)")
     args = parser.parse_args()
 
     if args.resize_shape <= 0:
@@ -623,8 +637,28 @@ def main():
     else:
         print(f"env.reset() output: {type(result)}, shape={result.shape}, dtype={result.dtype}")
 
-    policy_net = DuelingCategoricalDQN((args.num_stack, args.resize_shape, args.resize_shape, 1), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max, std_init=args.std_init).to(device)
-    target_net = DuelingCategoricalDQN((args.num_stack, args.resize_shape, args.resize_shape, 1), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max, std_init=args.std_init).to(device)
+    policy_net = CategoricalDQN(
+        (args.num_stack, args.resize_shape, args.resize_shape, 1),
+        num_actions=env.action_space.n,
+        num_atoms=args.num_atoms,
+        V_min=args.V_min,
+        V_max=args.V_max,
+        std_init=args.std_init,
+        use_dueling=args.use_dueling
+    ).to(device)
+    
+    target_net = None
+    if args.use_double_dqn:
+        target_net = CategoricalDQN(
+            (args.num_stack, args.resize_shape, args.resize_shape, 1),
+            num_actions=env.action_space.n,
+            num_atoms=args.num_atoms,
+            V_min=args.V_min,
+            V_max=args.V_max,
+            std_init=args.std_init,
+            use_dueling=args.use_dueling
+        ).to(device)
+        target_net.load_state_dict(policy_net.state_dict())
 
     start_steps = 0
     start_episode = 0
@@ -632,7 +666,6 @@ def main():
     if args.checkpoint_path:
         start_steps, start_episode, warmup_done = load_checkpoint(policy_net, args.checkpoint_path, device)
 
-    target_net.load_state_dict(policy_net.state_dict())
     optimizer = optim.Adam(policy_net.parameters(), lr=args.lr, eps=args.eps)
     memory = SumTree(capacity=args.memory_capacity)
 
