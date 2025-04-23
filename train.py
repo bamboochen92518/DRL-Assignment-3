@@ -1,5 +1,6 @@
 import gym
 import gym_super_mario_bros
+from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
 from nes_py.wrappers import JoypadSpace
 from gym import Wrapper
 import numpy as np
@@ -11,22 +12,7 @@ from collections import namedtuple
 import random
 from tqdm import tqdm
 import argparse
-
-# Action space
-COMPLEX_MOVEMENT = [
-    ['NOOP'],
-    ['right'],
-    ['right', 'A'],
-    ['right', 'B'],
-    ['right', 'A', 'B'],
-    ['A'],
-    ['left'],
-    ['left', 'A'],
-    ['left', 'B'],
-    ['left', 'A', 'B'],
-    ['down'],
-    ['up'],
-]
+import cv2
 
 # Compatibility Wrapper for Old Gym API
 class ResetCompatibilityWrapper(Wrapper):
@@ -36,7 +22,6 @@ class ResetCompatibilityWrapper(Wrapper):
             obs, info = result
         else:
             obs, info = result, {}
-        # Ensure obs is a NumPy array with shape (height, width, 3)
         obs = np.array(obs, dtype=np.uint8)
         if len(obs.shape) == 3 and obs.shape[-1] == 4:  # RGBA to RGB
             obs = obs[..., :3]
@@ -62,6 +47,26 @@ class ResetCompatibilityWrapper(Wrapper):
             obs = np.stack([obs] * 3, axis=-1)
         return obs, reward, terminated, truncated, info
 
+# Resize Observation Wrapper
+class ResizeObservation(Wrapper):
+    def __init__(self, env, shape):
+        super(ResizeObservation, self).__init__(env)
+        self.shape = shape  # (height, width)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        obs = self._resize(obs)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        obs = self._resize(obs)
+        return obs, reward, terminated, truncated, info
+
+    def _resize(self, obs):
+        obs = cv2.resize(obs, self.shape[::-1], interpolation=cv2.INTER_AREA)
+        return obs
+
 # Noisy Linear Layer for Noisy Nets
 class NoisyLinear(nn.Module):
     def __init__(self, in_features, out_features, sigma_init=0.017):
@@ -86,7 +91,7 @@ class NoisyLinear(nn.Module):
 
 # Dueling Categorical DQN
 class DuelingCategoricalDQN(nn.Module):
-    def __init__(self, input_shape=(3, 240, 256), num_actions=12, num_atoms=51, V_min=-10, V_max=10):
+    def __init__(self, input_shape, num_actions=12, num_atoms=51, V_min=-10, V_max=10):
         super(DuelingCategoricalDQN, self).__init__()
         self.num_actions = num_actions
         self.num_atoms = num_atoms
@@ -322,12 +327,18 @@ def main():
     parser.add_argument("--alpha", type=float, default=0.6, help="Prioritized replay alpha")
     parser.add_argument("--beta", type=float, default=0.4, help="Prioritized replay beta")
     parser.add_argument("--num_eval_episodes", type=int, default=5, help="Number of evaluation episodes")
+    parser.add_argument("--resize_shape", type=int, default=84, help="Size for resizing observations (resize_shape x resize_shape)")
     args = parser.parse_args()
+
+    # Validate resize_shape
+    if args.resize_shape <= 0:
+        raise ValueError("resize_shape must be a positive integer")
 
     # Set up environment
     env = gym_super_mario_bros.make('SuperMarioBros-1-1-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     env = ResetCompatibilityWrapper(env)
+    env = ResizeObservation(env, shape=(args.resize_shape, args.resize_shape))
 
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -340,8 +351,8 @@ def main():
     print(f"Observation: type={type(obs)}, shape={obs.shape if isinstance(obs, np.ndarray) else 'N/A'}, dtype={obs.dtype if isinstance(obs, np.ndarray) else 'N/A'}")
 
     # Initialize networks
-    policy_net = DuelingCategoricalDQN((3, 240, 256), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
-    target_net = DuelingCategoricalDQN((3, 240, 256), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
+    policy_net = DuelingCategoricalDQN((3, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
+    target_net = DuelingCategoricalDQN((3, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
     target_net.load_state_dict(policy_net.state_dict())
     optimizer = optim.Adam(policy_net.parameters(), lr=args.lr, eps=args.eps)
     memory = PrioritizedReplayBuffer(capacity=args.memory_capacity, alpha=args.alpha)
