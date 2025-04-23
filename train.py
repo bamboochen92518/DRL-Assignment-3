@@ -486,7 +486,7 @@ def main():
     env = CustomFrameStack(env, num_stack=4)
     env = ActionRepeatWrapper(env, repeat=4)
 
-    Bucks# Set up device
+    # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
