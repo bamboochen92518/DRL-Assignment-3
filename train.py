@@ -8,13 +8,97 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import os
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 import random
 from tqdm import tqdm
 import argparse
 import cv2
 import math
 from gym.wrappers import FrameStack
+
+# SumTree (from provided code)
+class SumTree:
+    def __init__(self, capacity):
+        self.capacity = 1
+        while self.capacity < capacity:
+            self.capacity *= 2
+
+        self.tree = defaultdict(float)
+        self.dataset = {}
+
+        self.leaf_idx_offset = self.capacity - 1
+        self.tree_leaf_pos = 0
+
+        self.length = 0
+        self.min_priority, self.max_priority = 1.0, 1.0
+
+    def __len__(self):
+        return self.length
+
+    def add(self, data, priority=None):
+        self.length = min(self.length + 1, self.capacity)
+
+        if priority is None:
+            priority = self.max_priority
+        elif priority > self.max_priority:
+            self.max_priority = priority
+        if priority < self.min_priority:
+            self.min_priority = priority
+
+        leaf_real_idx = self.leaf_idx_offset + self.tree_leaf_pos
+        self.dataset[leaf_real_idx] = data
+
+        self.update_priority(leaf_real_idx, priority)
+
+        self.tree_leaf_pos += 1
+        self.tree_leaf_pos %= self.capacity
+
+    def update_priority(self, leaf_real_idx, priority):
+        self.tree[leaf_real_idx] = priority
+
+        while True:
+            parent_idx = (leaf_real_idx - 1) // 2
+            if leaf_real_idx % 2 == 0:
+                self.tree[parent_idx] = self.tree[leaf_real_idx - 1] + self.tree[leaf_real_idx]
+            else:
+                self.tree[parent_idx] = self.tree[leaf_real_idx] + self.tree[leaf_real_idx + 1]
+            leaf_real_idx = parent_idx
+            if parent_idx == 0:
+                break
+
+    def sample(self, batch_size, n_step=1):
+        seg = self.tree[0] / batch_size
+        batch_data_idx = []
+        for i in range(batch_size):
+            rnd_value = random.uniform(a=seg * i, b=seg * (i + 1))
+            son_idx = 1
+            while True:
+                if self.tree[son_idx] < rnd_value:
+                    rnd_value -= self.tree[son_idx]
+                    son_idx += 1
+
+                if son_idx >= self.leaf_idx_offset:
+                    break
+
+                son_idx = son_idx * 2 + 1
+
+            batch_data_idx.append(son_idx)
+
+        batch_seq_data = []
+        for idx in batch_data_idx:
+            seq_data = [self.dataset[idx]]
+            while len(seq_data) < n_step:
+                done = seq_data[-1][4]
+                if done:
+                    break
+
+                next_leaf_idx = self.leaf_idx_offset + (idx + len(seq_data) - self.leaf_idx_offset) % self.capacity
+                if next_leaf_idx not in self.dataset:
+                    break
+                seq_data.append(self.dataset[next_leaf_idx])
+            batch_seq_data.append(seq_data)
+
+        return batch_data_idx, batch_seq_data, [self.tree[idx] for idx in batch_data_idx]
 
 # NoisyLinear (unchanged)
 class NoisyLinear(torch.nn.Module):
@@ -158,7 +242,7 @@ class ResizeObservation(Wrapper):
         obs = np.expand_dims(obs, axis=-1)
         return obs
 
-# DuelingCategoricalDQN (unchanged)
+# DuelingCategoricalDQN (modified to add zero_noise)
 class DuelingCategoricalDQN(nn.Module):
     def __init__(self, input_shape, num_actions=12, num_atoms=51, V_min=-10, V_max=10, std_init=0.5):
         super(DuelingCategoricalDQN, self).__init__()
@@ -198,51 +282,33 @@ class DuelingCategoricalDQN(nn.Module):
         probs = value + (advantage - advantage.mean(dim=1, keepdim=True))
         return torch.softmax(probs, dim=-1)
 
-# PrioritizedReplayBuffer (unchanged)
-Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'done', 'gamma'))
+    def reset_noise(self):
+        for module in self.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_noise()
 
-class PrioritizedReplayBuffer:
-    def __init__(self, capacity, alpha=0.5):
-        self.capacity = capacity
-        self.alpha = alpha
-        self.buffer = []
-        self.priorities = np.zeros((capacity,), dtype=np.float32)
-        self.pos = 0
-        self.max_priority = 1.0
+    def zero_noise(self):
+        for module in self.modules():
+            if isinstance(module, NoisyLinear):
+                module.w_epsilon.zero_()
+                module.b_epsilon.zero_()
 
-    def push(self, *args):
-        transition = Transition(*args)
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(transition)
-        else:
-            self.buffer[self.pos] = transition
-        self.priorities[self.pos] = self.max_priority
-        self.pos = (self.pos + 1) % self.capacity
+# Transition and stack_data (for compatibility with SumTree)
+Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done', 'gamma'))
 
-    def sample(self, batch_size, beta=0.4):
-        if len(self.buffer) == self.capacity:
-            prios = self.priorities
-        else:
-            prios = self.priorities[:self.pos]
-        probs = prios ** self.alpha
-        probs /= probs.sum()
-        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
-        samples = [self.buffer[idx] for idx in indices]
-        weights = (len(self.buffer) * probs[indices]) ** (-beta)
-        weights /= weights.max()
-        return samples, indices, weights
-
-    def update_priorities(self, indices, priorities):
-        for idx, priority in zip(indices, priorities):
-            self.priorities[idx] = priority
-            self.max_priority = max(self.max_priority, priority)
+def stack_data(batch_data, device='cpu'):
+    assert isinstance(batch_data, (list, tuple))
+    if isinstance(batch_data[0], torch.Tensor):
+        return torch.stack(batch_data).to(device)
+    else:
+        return torch.tensor(batch_data).to(device)
 
 # get_beta (unchanged)
 def get_beta(step, total_steps, beta_start=0.4, beta_end=1.0):
     fraction = min(1.0, step / total_steps)
     return beta_start + fraction * (beta_end - beta_start)
 
-# train_rainbow_dqn (unchanged)
+# train_rainbow_dqn (modified for gradient clipping and SumTree)
 def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=0, start_episode=0, warmup_done=False):
     num_actions = env.action_space.n
     num_atoms = args.num_atoms
@@ -279,7 +345,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                 next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device) / 255.0
                 reward = reward
                 gamma_val = 0.0 if done else gamma
-                memory.push(state.cpu().numpy(), action, next_state.cpu().numpy(), reward, done, gamma_val)
+                memory.add(data=(state.cpu().numpy(), action, reward, next_state.cpu().numpy(), done), priority=None)
                 state = next_state
                 steps_done += 1
                 pbar.update(1)
@@ -292,9 +358,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
 
     with tqdm(range(start_episode, args.num_episodes), desc="Training Episodes", unit="episode") as pbar:
         for episode in pbar:
-            for module in policy_net.modules():
-                if isinstance(module, NoisyLinear):
-                    module.reset_noise()
+            policy_net.reset_noise()
             state, info = env.reset()
             state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0
             episode_reward = 0
@@ -317,27 +381,43 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                 reward = reward
                 gamma_val = 0.0 if done else gamma
                 episode_reward += reward
-                memory.push(state.cpu().numpy(), action, next_state.cpu().numpy(), reward, done, gamma_val)
+                memory.add(data=(state.cpu().numpy(), action, reward, next_state.cpu().numpy(), done), priority=None)
                 state = next_state
                 steps_done += 1
 
-                if len(memory.buffer) >= batch_size and steps_done % 4 == 0:
-                    transitions, indices, weights = memory.sample(batch_size, beta=get_beta(steps_done, args.total_steps))
-                    batch = Transition(*zip(*transitions))
-                    states = torch.tensor(np.array(batch.state), dtype=torch.float32, device=device) / 255.0
-                    actions = torch.tensor(batch.action, device=device)
-                    rewards = torch.tensor(batch.reward, device=device)
-                    next_states = torch.tensor(np.array(batch.next_state), dtype=torch.float32, device=device) / 255.0
-                    dones = torch.tensor(batch.done, device=device, dtype=torch.float32)
-                    gammas = torch.tensor(batch.gamma, device=device)
+                if len(memory) >= batch_size and steps_done % 4 == 0:
+                    # Sample using SumTree
+                    batch_idx, batch_seq_data, sampling_weight = memory.sample(batch_size, n_step)
+                    bias_max_weight = (len(memory) * memory.min_priority) ** (-get_beta(steps_done, args.total_steps))
+                    bias_weight = (len(memory) * np.array(sampling_weight)) ** (-get_beta(steps_done, args.total_steps))
+                    weights = torch.tensor(bias_weight / bias_max_weight, dtype=torch.float32, device=device)
+
+                    # Process batch data for n-step learning
+                    batch_data = []
+                    for seq_data in batch_seq_data:
+                        data = list(seq_data.pop(0))
+                        data.append(len(seq_data) + 1)
+                        if len(seq_data) > 0:
+                            data[3] = seq_data[-1][3]
+                        for i, _data in enumerate(seq_data):
+                            data[2] += (gamma ** (i + 1)) * _data[2]
+                        batch_data.append(data)
+
+                    states = stack_data([data[0] for data in batch_data], device) / 255.0
+                    actions = stack_data([data[1] for data in batch_data], device)
+                    rewards = stack_data([data[2] for data in batch_data], device)
+                    next_states = stack_data([data[3] for data in batch_data], device) / 255.0
+                    dones = stack_data([data[4] for data in batch_data], device).to(rewards.dtype)
+                    n_steps = [data[5] for data in batch_data]
 
                     with torch.no_grad():
                         with torch.cuda.amp.autocast() if device.type == "cuda" else torch.no_grad():
+                            gammas = stack_data([gamma ** n for n in n_steps], device)
                             next_probs = target_net(next_states)
                             next_q = (next_probs * z).sum(dim=-1)
                             next_action = next_q.argmax(dim=1)
                             target_probs = next_probs[range(batch_size), next_action]
-                            target_z = rewards.unsqueeze(1) + (gammas.unsqueeze(1) ** n_step) * z.unsqueeze(0) * (1 - dones).unsqueeze(1)
+                            target_z = rewards.unsqueeze(1) + (1 - dones.unsqueeze(1)) * gammas.unsqueeze(1) * z.unsqueeze(0)
                             target_z = target_z.clamp(V_min, V_max)
                             b = (target_z - V_min) / delta_z
                             l = b.floor().long()
@@ -358,7 +438,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                     with torch.cuda.amp.autocast() if device.type == "cuda" else torch.no_grad():
                         probs = policy_net(states)[range(batch_size), actions]
                         loss = -(m * torch.log(probs + 1e-10)).sum(dim=-1)
-                        weighted_loss = torch.tensor(weights, device=device) * loss
+                        weighted_loss = weights * loss
                         priorities = loss.detach().cpu().numpy() + 1e-5
                         loss = weighted_loss.mean()
 
@@ -369,7 +449,11 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                         scaler.update()
                     else:
                         loss.backward()
+                        torch.nn.utils.clip_grad_norm_(policy_net.parameters(), args.grad_clip_norm)
                         optimizer.step()
+
+                    for idx, priority in zip(batch_idx, priorities):
+                        memory.update_priority(idx, (priority ** args.alpha).item())
 
                 if steps_done % target_update == 0:
                     target_net.load_state_dict(policy_net.state_dict())
@@ -390,25 +474,27 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                     torch.save(checkpoint, f"checkpoints/checkpoint_episode_{episode + 1}.pth")
                 except Exception as e:
                     print(f"Error saving checkpoint: {e}")
-                evaluate_agent(env, policy_net, args)
+                evaluate_agent(env, policy_net, args, episode, steps_done)
 
     return policy_net
 
-# evaluate_agent (unchanged)
-def evaluate_agent(env, policy_net, args):
+# evaluate_agent (modified for 10 episodes, checkpoint saving, and avg reward only)
+def evaluate_agent(env, policy_net, args, episode, steps_done):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_atoms = args.num_atoms
     V_min = args.V_min
     V_max = args.V_max
     z = torch.linspace(V_min, V_max, num_atoms).to(device)
 
-    for episode in tqdm(range(args.num_eval_episodes), desc="Evaluation Episodes"):
-        for module in policy_net.modules():
-            if isinstance(module, NoisyLinear):
-                module.reset_noise()
+    policy_net.eval()
+    total_reward = 0
+    num_episodes = 10
+
+    for ep in tqdm(range(num_episodes), desc="Evaluation Episodes"):
+        policy_net.zero_noise()  # Use zero_noise during evaluation
         state, info = env.reset()
         state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0
-        total_reward = 0
+        episode_reward = 0
         done = False
         while not done:
             with torch.no_grad():
@@ -420,8 +506,26 @@ def evaluate_agent(env, policy_net, args):
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device) / 255.0
-            total_reward += reward
-        print(f"Evaluation Episode {episode + 1}, Reward: {total_reward:.2f}, x_pos: {info.get('x_pos', 0)}, coins: {info.get('coins', 0)}, time: {info.get('time', 400)}, flag_get: {info.get('flag_get', False)}")
+            episode_reward += reward
+        total_reward += episode_reward
+
+    avg_reward = total_reward / num_episodes
+    print(f"Evaluation after episode {episode + 1}: Average reward = {avg_reward}")
+
+    try:
+        os.makedirs("checkpoints", exist_ok=True)
+        ckpt_path = f"checkpoints/eval_ckpt_{steps_done}.pth"
+        torch.save({
+            'state_dict': policy_net.state_dict(),
+            'steps_done': steps_done,
+            'episode': episode,
+        }, ckpt_path)
+        print(f"Saved evaluation checkpoint at {ckpt_path}")
+    except Exception as e:
+        print(f"Error saving evaluation checkpoint: {e}")
+
+    policy_net.train()
+    return avg_reward
 
 # load_checkpoint (unchanged)
 def load_checkpoint(model, checkpoint_path, device):
@@ -441,7 +545,7 @@ def load_checkpoint(model, checkpoint_path, device):
         print(f"Error loading checkpoint: {e}")
         raise
 
-# main (modified)
+# main (modified to add grad_clip_norm)
 def main():
     parser = argparse.ArgumentParser(description="Rainbow DQN for Super Mario Bros")
     parser.add_argument("--num_episodes", type=int, default=1000, help="Number of training episodes")
@@ -464,8 +568,9 @@ def main():
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to checkpoint file to load (optional)")
     parser.add_argument("--checkpoint_interval", type=int, default=100, help="Interval (in episodes) to save checkpoints and evaluate")
     parser.add_argument("--std_init", type=float, default=0.5, help="Initial standard deviation for NoisyLinear layers")
-    parser.add_argument("--num_stack", type=int, default=3, help="Number of frames to stack in CustomFrameStack")
+    parser.add_argument("--num_stack", type=int, default=4, help="Number of frames to stack in CustomFrameStack")
     parser.add_argument("--repeat", type=int, default=4, help="Number of action repeats in ActionRepeatWrapper")
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Gradient clipping norm")
     args = parser.parse_args()
 
     # Validate arguments
@@ -483,6 +588,8 @@ def main():
         raise ValueError("num_stack must be a positive integer")
     if args.repeat <= 0:
         raise ValueError("repeat must be a positive integer")
+    if args.grad_clip_norm <= 0:
+        raise ValueError("grad_clip_norm must be a positive float")
 
     # Set up environment
     env = gym_super_mario_bros.make('SuperMarioBros-1-1-v0')
@@ -518,7 +625,7 @@ def main():
 
     target_net.load_state_dict(policy_net.state_dict())
     optimizer = optim.Adam(policy_net.parameters(), lr=args.lr, eps=args.eps)
-    memory = PrioritizedReplayBuffer(capacity=args.memory_capacity, alpha=args.alpha)
+    memory = SumTree(capacity=args.memory_capacity)
 
     # Train the model
     print("Starting training...")
@@ -527,7 +634,7 @@ def main():
 
     # Final evaluation
     print("Evaluating final model...")
-    evaluate_agent(env, policy_net, args)
+    evaluate_agent(env, policy_net, args, args.num_episodes, steps_done)
     env.close()
 
 if __name__ == "__main__":
