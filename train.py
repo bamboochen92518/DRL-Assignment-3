@@ -18,7 +18,7 @@ from gym.wrappers import FrameStack
 
 # NoisyLinear (unchanged)
 class NoisyLinear(torch.nn.Module):
-    def __init__(self, in_features, out_features, std_init=0.5):
+    def __init__(self, in_features, out_features, std_init=0.1):
         super(NoisyLinear, self).__init__()
         self.in_features, self.out_features, self.std_init = in_features, out_features, std_init
         self.w_mu = torch.nn.Parameter(torch.Tensor(out_features, in_features))
@@ -108,7 +108,7 @@ class ResetCompatibilityWrapper(Wrapper):
             obs = np.stack([obs] * 3, axis=-1)
         return obs, reward, terminated, truncated, info
 
-# CustomFrameStack (modified)
+# CustomFrameStack (unchanged)
 class CustomFrameStack(Wrapper):
     def __init__(self, env, num_stack=4):
         super().__init__(env)
@@ -122,19 +122,19 @@ class CustomFrameStack(Wrapper):
             obs, info = result
         else:
             obs, info = result, {}
-        obs = np.array(obs, dtype=np.uint8)  # Shape: (84, 84, 1)
-        obs = obs.squeeze(-1)  # Shape: (84, 84)
+        obs = np.array(obs, dtype=np.uint8)
+        obs = obs.squeeze(-1)
         self.frames = [obs] * self.num_stack
-        return np.stack(self.frames, axis=0), info  # Shape: (4, 84, 84)
+        return np.stack(self.frames, axis=0), info
 
     def step(self, action):
         result = self.env.step(action)
         obs, reward, terminated, truncated, info = result
-        obs = np.array(obs, dtype=np.uint8)  # Shape: (84, 84, 1)
-        obs = obs.squeeze(-1)  # Shape: (84, 84)
+        obs = np.array(obs, dtype=np.uint8)
+        obs = obs.squeeze(-1)
         self.frames.pop(0)
         self.frames.append(obs)
-        return np.stack(self.frames, axis=0), reward, terminated, truncated, info  # Shape: (4, 84, 84)
+        return np.stack(self.frames, axis=0), reward, terminated, truncated, info
 
 # ResizeObservation (unchanged)
 class ResizeObservation(Wrapper):
@@ -176,14 +176,14 @@ class DuelingCategoricalDQN(nn.Module):
         )
         conv_out_size = self._get_conv_out(input_shape)
         self.fc_value = nn.Sequential(
-            NoisyLinear(conv_out_size, 512, std_init=0.5),
+            NoisyLinear(conv_out_size, 512, std_init=0.1),
             nn.ReLU(),
-            NoisyLinear(512, num_atoms, std_init=0.5)
+            NoisyLinear(512, num_atoms, std_init=0.1)
         )
         self.fc_advantage = nn.Sequential(
-            NoisyLinear(conv_out_size, 512, std_init=0.5),
+            NoisyLinear(conv_out_size, 512, std_init=0.1),
             nn.ReLU(),
-            NoisyLinear(512, num_actions * num_atoms, std_init=0.5)
+            NoisyLinear(512, num_actions * num_atoms, std_init=0.1)
         )
 
     def _get_conv_out(self, shape):
@@ -242,7 +242,7 @@ def get_beta(step, total_steps, beta_start=0.4, beta_end=1.0):
     fraction = min(1.0, step / total_steps)
     return beta_start + fraction * (beta_end - beta_start)
 
-# train_rainbow_dqn (modified)
+# train_rainbow_dqn (unchanged)
 def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
     num_actions = env.action_space.n
     num_atoms = args.num_atoms
@@ -258,18 +258,25 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
     z = torch.linspace(V_min, V_max, num_atoms).to(device)
     history_rewards = []
     steps_done = 0
+    epsilon_start = 1.0
+    epsilon_end = 0.1
+    epsilon_decay = args.total_steps // 2
+
+    def get_epsilon(step):
+        fraction = min(1.0, step / epsilon_decay)
+        return epsilon_start + fraction * (epsilon_end - epsilon_start)
 
     # Warmup phase
     print("Starting warmup phase...")
     state, info = env.reset()
-    state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0  # Shape: (4, 84, 84)
+    state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0
     with tqdm(total=warmup_steps, desc="Warmup Steps") as pbar:
         while steps_done < warmup_steps:
             action = env.action_space.sample()
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device) / 255.0
-            reward = np.clip(reward, -1, 1)
+            reward = reward
             gamma_val = 0.0 if done else gamma
             memory.push(state.cpu().numpy(), action, next_state.cpu().numpy(), reward, done, gamma_val)
             state = next_state
@@ -292,15 +299,19 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
             done = False
 
             while not done:
-                with torch.no_grad():
-                    state_batched = state.unsqueeze(0)  # Shape: (1, 4, 84, 84)
-                    probs = policy_net(state_batched)
-                    q_values = (probs * z).sum(dim=-1)
-                    action = q_values.argmax(dim=1).item()
+                epsilon = get_epsilon(steps_done)
+                if random.random() < epsilon:
+                    action = env.action_space.sample()
+                else:
+                    with torch.no_grad():
+                        state_batched = state.unsqueeze(0)
+                        probs = policy_net(state_batched)
+                        q_values = (probs * z).sum(dim=-1)
+                        action = q_values.argmax(dim=1).item()
                 next_state, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
                 next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device) / 255.0
-                reward = np.clip(reward, -1, 1)
+                reward = reward
                 gamma_val = 0.0 if done else gamma
                 episode_reward += reward
                 memory.push(state.cpu().numpy(), action, next_state.cpu().numpy(), reward, done, gamma_val)
@@ -310,7 +321,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                 if len(memory.buffer) >= batch_size and steps_done % 4 == 0:
                     transitions, indices, weights = memory.sample(batch_size, beta=get_beta(steps_done, args.total_steps))
                     batch = Transition(*zip(*transitions))
-                    states = torch.tensor(np.array(batch.state), dtype=torch.float32, device=device) / 255.0  # Shape: (batch, 4, 84, 84)
+                    states = torch.tensor(np.array(batch.state), dtype=torch.float32, device=device) / 255.0
                     actions = torch.tensor(batch.action, device=device)
                     rewards = torch.tensor(batch.reward, device=device)
                     next_states = torch.tensor(np.array(batch.next_state), dtype=torch.float32, device=device) / 255.0
@@ -345,7 +356,6 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                     weighted_loss = torch.tensor(weights, device=device) * loss
                     priorities = loss.detach().cpu().numpy() + 1e-5
                     loss = weighted_loss.mean()
-                    memory.update_priorities(indices, priorities)
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
@@ -367,7 +377,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
 
     return policy_net
 
-# evaluate_agent (modified)
+# evaluate_agent (unchanged)
 def evaluate_agent(env, policy_net, args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_atoms = args.num_atoms
@@ -380,21 +390,33 @@ def evaluate_agent(env, policy_net, args):
             if isinstance(module, NoisyLinear):
                 module.reset_noise()
         state, info = env.reset()
-        state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0  # Shape: (4, 84, 84)
+        state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0
         total_reward = 0
         done = False
         while not done:
             with torch.no_grad():
-                state_batched = state.unsqueeze(0)  # Shape: (1, 4, 84, 84)
+                state_batched = state.unsqueeze(0)
                 probs = policy_net(state_batched)
                 q_values = (probs * z).sum(dim=-1)
                 action = q_values.argmax(dim=1).item()
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device) / 255.0
-            reward = np.clip(reward, -1, 1)
             total_reward += reward
         print(f"Evaluation Episode {episode + 1}, Reward: {total_reward:.2f}, x_pos: {info.get('x_pos', 0)}, coins: {info.get('coins', 0)}, time: {info.get('time', 400)}, flag_get: {info.get('flag_get', False)}")
+
+# load_checkpoint (new)
+def load_checkpoint(model, checkpoint_path, device):
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint)
+        print(f"Loaded checkpoint from {checkpoint_path}")
+    except FileNotFoundError:
+        print(f"Checkpoint file {checkpoint_path} not found.")
+        raise
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        raise
 
 # main (modified)
 def main():
@@ -416,6 +438,7 @@ def main():
     parser.add_argument("--num_eval_episodes", type=int, default=5, help="Number of evaluation episodes")
     parser.add_argument("--resize_shape", type=int, default=84, help="Size for resizing observations")
     parser.add_argument("--total_steps", type=int, default=10000000, help="Total steps for beta annealing")
+    parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to checkpoint file to load (optional)")
     args = parser.parse_args()
 
     # Validate resize_shape
@@ -446,6 +469,11 @@ def main():
     # Initialize networks
     policy_net = DuelingCategoricalDQN((4, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
     target_net = DuelingCategoricalDQN((4, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
+
+    # Load checkpoint if provided
+    if args.checkpoint_path:
+        load_checkpoint(policy_net, args.checkpoint_path, device)
+
     target_net.load_state_dict(policy_net.state_dict())
     optimizer = optim.Adam(policy_net.parameters(), lr=args.lr, eps=args.eps)
     memory = PrioritizedReplayBuffer(capacity=args.memory_capacity, alpha=args.alpha)
