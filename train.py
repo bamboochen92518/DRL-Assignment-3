@@ -157,7 +157,7 @@ class ActionRepeatWrapper(Wrapper):
         self.step_count = 0
         return self.env.reset(**kwargs)
 
-# ResetCompatibilityWrapper (unchanged)
+# ResetCompatibilityWrapper (modified to keep grayscale)
 class ResetCompatibilityWrapper(Wrapper):
     def reset(self, **kwargs):
         result = self.env.reset(**kwargs)
@@ -166,10 +166,12 @@ class ResetCompatibilityWrapper(Wrapper):
         else:
             obs, info = result, {}
         obs = np.array(obs, dtype=np.uint8)
+        # Remove alpha channel if present, but don't convert grayscale to RGB
         if len(obs.shape) == 3 and obs.shape[-1] == 4:
-            obs = obs[..., :3]
-        elif len(obs.shape) == 2:
-            obs = np.stack([obs] * 3, axis=-1)
+            obs = obs[..., :3]  # RGBA -> RGB (temporary, will be converted to grayscale later)
+        # Ensure the observation is in (height, width, channels) format
+        if len(obs.shape) == 2:
+            obs = np.expand_dims(obs, axis=-1)  # (height, width) -> (height, width, 1)
         if isinstance(self.env, (FrameStack, CustomFrameStack)):
             return obs
         return obs, info
@@ -180,19 +182,19 @@ class ResetCompatibilityWrapper(Wrapper):
             obs, reward, done, info = result
             obs = np.array(obs, dtype=np.uint8)
             if len(obs.shape) == 3 and obs.shape[-1] == 4:
-                obs = obs[..., :3]
-            elif len(obs.shape) == 2:
-                obs = np.stack([obs] * 3, axis=-1)
+                obs = obs[..., :3]  # RGBA -> RGB (temporary, will be converted to grayscale later)
+            if len(obs.shape) == 2:
+                obs = np.expand_dims(obs, axis=-1)  # (height, width) -> (height, width, 1)
             return obs, reward, done, False, info
         obs, reward, terminated, truncated, info = result
         obs = np.array(obs, dtype=np.uint8)
         if len(obs.shape) == 3 and obs.shape[-1] == 4:
-            obs = obs[..., :3]
-        elif len(obs.shape) == 2:
-            obs = np.stack([obs] * 3, axis=-1)
+            obs = obs[..., :3]  # RGBA -> RGB (temporary, will be converted to grayscale later)
+        if len(obs.shape) == 2:
+            obs = np.expand_dims(obs, axis=-1)  # (height, width) -> (height, width, 1)
         return obs, reward, terminated, truncated, info
 
-# CustomFrameStack (unchanged)
+# CustomFrameStack (modified to handle grayscale)
 class CustomFrameStack(Wrapper):
     def __init__(self, env, num_stack=4):
         super().__init__(env)
@@ -207,7 +209,10 @@ class CustomFrameStack(Wrapper):
         else:
             obs, info = result, {}
         obs = np.array(obs, dtype=np.uint8)
-        obs = obs.squeeze(-1)
+        # Ensure grayscale (1 channel)
+        if obs.shape[-1] == 3:  # If RGB, convert to grayscale
+            obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+            obs = np.expand_dims(obs, axis=-1)
         self.frames = [obs] * self.num_stack
         return np.stack(self.frames, axis=0), info
 
@@ -215,12 +220,15 @@ class CustomFrameStack(Wrapper):
         result = self.env.step(action)
         obs, reward, terminated, truncated, info = result
         obs = np.array(obs, dtype=np.uint8)
-        obs = obs.squeeze(-1)
+        # Ensure grayscale (1 channel)
+        if obs.shape[-1] == 3:  # If RGB, convert to grayscale
+            obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+            obs = np.expand_dims(obs, axis=-1)
         self.frames.pop(0)
         self.frames.append(obs)
         return np.stack(self.frames, axis=0), reward, terminated, truncated, info
 
-# ResizeObservation (unchanged)
+# ResizeObservation (unchanged, already outputs grayscale)
 class ResizeObservation(Wrapper):
     def __init__(self, env, shape):
         super().__init__(env)
@@ -238,11 +246,13 @@ class ResizeObservation(Wrapper):
 
     def _resize_grayscale(self, obs):
         obs = cv2.resize(obs, self.shape[::-1], interpolation=cv2.INTER_AREA)
-        obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-        obs = np.expand_dims(obs, axis=-1)
+        # If obs is RGB, convert to grayscale
+        if len(obs.shape) == 3 and obs.shape[-1] == 3:
+            obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+            obs = np.expand_dims(obs, axis=-1)
         return obs
 
-# DuelingCategoricalDQN (unchanged)
+# DuelingCategoricalDQN (modified for grayscale input)
 class DuelingCategoricalDQN(nn.Module):
     def __init__(self, input_shape, num_actions=12, num_atoms=51, V_min=-10, V_max=10, std_init=0.5):
         super(DuelingCategoricalDQN, self).__init__()
@@ -250,8 +260,9 @@ class DuelingCategoricalDQN(nn.Module):
         self.num_atoms = num_atoms
         self.V_min = V_min
         self.V_max = V_max
+        # Input shape is (num_stack, height, width, 1) for grayscale
         self.conv = nn.Sequential(
-            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
+            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),  # input_shape[0] = num_stack * channels, channels=1
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
@@ -310,7 +321,7 @@ def get_beta(step, total_steps, beta_start=0.4, beta_end=1.0):
     fraction = min(1.0, step / total_steps)
     return beta_start + fraction * (beta_end - beta_start)
 
-# train_rainbow_dqn (fixed gammas definition)
+# train_rainbow_dqn (unchanged)
 def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=0, start_episode=0, warmup_done=False):
     num_actions = env.action_space.n
     num_atoms = args.num_atoms
@@ -615,8 +626,9 @@ def main():
         print(f"env.reset() output: {type(result)}, shape={result.shape}, dtype={result.dtype}")
 
     # Initialize networks
-    policy_net = DuelingCategoricalDQN((args.num_stack, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max, std_init=args.std_init).to(device)
-    target_net = DuelingCategoricalDQN((args.num_stack, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max, std_init=args.std_init).to(device)
+    # Input shape is (num_stack, height, width, 1) for grayscale
+    policy_net = DuelingCategoricalDQN((args.num_stack, args.resize_shape, args.resize_shape, 1), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max, std_init=args.std_init).to(device)
+    target_net = DuelingCategoricalDQN((args.num_stack, args.resize_shape, args.resize_shape, 1), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max, std_init=args.std_init).to(device)
 
     # Load checkpoint if provided
     start_steps = 0
