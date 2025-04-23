@@ -47,7 +47,7 @@ class ResetCompatibilityWrapper(Wrapper):
             obs = np.stack([obs] * 3, axis=-1)
         return obs, reward, terminated, truncated, info
 
-# Resize Observation Wrapper
+# Resize and Grayscale Observation Wrapper
 class ResizeObservation(Wrapper):
     def __init__(self, env, shape):
         super(ResizeObservation, self).__init__(env)
@@ -55,16 +55,21 @@ class ResizeObservation(Wrapper):
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        obs = self._resize(obs)
+        obs = self._resize_grayscale(obs)
         return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        obs = self._resize(obs)
+        obs = self._resize_grayscale(obs)
         return obs, reward, terminated, truncated, info
 
-    def _resize(self, obs):
+    def _resize_grayscale(self, obs):
+        # Resize (height, width, 3) to (new_height, new_width, 3)
         obs = cv2.resize(obs, self.shape[::-1], interpolation=cv2.INTER_AREA)
+        # Convert to grayscale
+        obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        # Add channel dimension: (height, width) -> (height, width, 1)
+        obs = np.expand_dims(obs, axis=-1)
         return obs
 
 # Noisy Linear Layer for Noisy Nets
@@ -195,6 +200,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+            reward = np.clip(reward, -1, 1)  # Clip reward to [-1, 1]
             memory.push(state.cpu().numpy(), action, next_state.cpu().numpy(), reward, done)
             state = next_state
             steps_done += 1
@@ -221,6 +227,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                 next_state, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
                 next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+                reward = np.clip(reward, -1, 1)  # Clip reward to [-1, 1]
                 # Optional reward shaping
                 # shaped_reward = reward + info.get('x_pos', 0) * 0.01
                 episode_reward += reward
@@ -307,6 +314,7 @@ def evaluate_agent(env, policy_net, args):
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+            reward = np.clip(reward, -1, 1)  # Clip reward to [-1, 1]
             # Optional reward shaping
             # shaped_reward = reward + info.get('x_pos', 0) * 0.01
             total_reward += reward
@@ -354,8 +362,8 @@ def main():
     print(f"Observation: type={type(obs)}, shape={obs.shape if isinstance(obs, np.ndarray) else 'N/A'}, dtype={obs.dtype if isinstance(obs, np.ndarray) else 'N/A'}")
 
     # Initialize networks
-    policy_net = DuelingCategoricalDQN((3, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
-    target_net = DuelingCategoricalDQN((3, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
+    policy_net = DuelingCategoricalDQN((1, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
+    target_net = DuelingCategoricalDQN((1, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
     target_net.load_state_dict(policy_net.state_dict())
     optimizer = optim.Adam(policy_net.parameters(), lr=args.lr, eps=args.eps)
     memory = PrioritizedReplayBuffer(capacity=args.memory_capacity, alpha=args.alpha)
