@@ -15,9 +15,8 @@ import argparse
 import cv2
 import math
 from gym.wrappers import FrameStack
-import lz4.frame
 
-# NoisyLinear (modified)
+# NoisyLinear (unchanged)
 class NoisyLinear(torch.nn.Module):
     def __init__(self, in_features, out_features, std_init):
         super(NoisyLinear, self).__init__()
@@ -109,13 +108,13 @@ class ResetCompatibilityWrapper(Wrapper):
             obs = np.stack([obs] * 3, axis=-1)
         return obs, reward, terminated, truncated, info
 
-# CustomFrameStack (unchanged)
+# CustomFrameStack (modified)
 class CustomFrameStack(Wrapper):
     def __init__(self, env, num_stack=4):
         super().__init__(env)
         self.num_stack = num_stack
         self.frames = [None] * num_stack
-        self.lz4_compress = True
+        self.lz4_compress = False  # Disable compression flag
 
     def reset(self, **kwargs):
         result = self.env.reset(**kwargs)
@@ -159,7 +158,7 @@ class ResizeObservation(Wrapper):
         obs = np.expand_dims(obs, axis=-1)
         return obs
 
-# DuelingCategoricalDQN (modified)
+# DuelingCategoricalDQN (unchanged)
 class DuelingCategoricalDQN(nn.Module):
     def __init__(self, input_shape, num_actions=12, num_atoms=51, V_min=-10, V_max=10, std_init=0.5):
         super(DuelingCategoricalDQN, self).__init__()
@@ -199,7 +198,7 @@ class DuelingCategoricalDQN(nn.Module):
         probs = value + (advantage - advantage.mean(dim=1, keepdim=True))
         return torch.softmax(probs, dim=-1)
 
-# PrioritizedReplayBuffer (unchanged)
+# PrioritizedReplayBuffer (modified)
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'done', 'gamma'))
 
 class PrioritizedReplayBuffer:
@@ -210,15 +209,9 @@ class PrioritizedReplayBuffer:
         self.priorities = np.zeros((capacity,), dtype=np.float32)
         self.pos = 0
         self.max_priority = 1.0
-        self.compress = True
 
     def push(self, *args):
         transition = Transition(*args)
-        if self.compress:
-            state = lz4.frame.compress(transition.state.tobytes())
-            next_state = lz4.frame.compress(transition.next_state.tobytes())
-            transition = Transition(state, transition.action, next_state,
-                                  transition.reward, transition.done, transition.gamma)
         if len(self.buffer) < self.capacity:
             self.buffer.append(transition)
         else:
@@ -237,18 +230,6 @@ class PrioritizedReplayBuffer:
         samples = [self.buffer[idx] for idx in indices]
         weights = (len(self.buffer) * probs[indices]) ** (-beta)
         weights /= weights.max()
-        if self.compress:
-            decompressed_samples = []
-            for sample in samples:
-                state = np.frombuffer(lz4.frame.decompress(sample.state), dtype=np.uint8)
-                state = state.reshape(4, 84, 84)
-                next_state = np.frombuffer(lz4.frame.decompress(sample.next_state), dtype=np.uint8)
-                next_state = next_state.reshape(4, 84, 84)
-                decompressed_samples.append(
-                    Transition(state, sample.action, next_state,
-                             sample.reward, sample.done, sample.gamma)
-                )
-            samples = decompressed_samples
         return samples, indices, weights
 
     def update_priorities(self, indices, priorities):
@@ -460,7 +441,7 @@ def load_checkpoint(model, checkpoint_path, device):
         print(f"Error loading checkpoint: {e}")
         raise
 
-# main (modified)
+# main (unchanged)
 def main():
     parser = argparse.ArgumentParser(description="Rainbow DQN for Super Mario Bros")
     parser.add_argument("--num_episodes", type=int, default=1000, help="Number of training episodes")
@@ -505,7 +486,7 @@ def main():
     env = CustomFrameStack(env, num_stack=4)
     env = ActionRepeatWrapper(env, repeat=4)
 
-    # Set up device
+    Bucks# Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
