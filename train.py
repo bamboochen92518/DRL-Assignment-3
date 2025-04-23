@@ -108,7 +108,7 @@ class ResetCompatibilityWrapper(Wrapper):
             obs = np.stack([obs] * 3, axis=-1)
         return obs, reward, terminated, truncated, info
 
-# CustomFrameStack (unchanged)
+# CustomFrameStack (modified)
 class CustomFrameStack(Wrapper):
     def __init__(self, env, num_stack=4):
         super().__init__(env)
@@ -122,17 +122,19 @@ class CustomFrameStack(Wrapper):
             obs, info = result
         else:
             obs, info = result, {}
-        obs = np.array(obs, dtype=np.uint8)
+        obs = np.array(obs, dtype=np.uint8)  # Shape: (84, 84, 1)
+        obs = obs.squeeze(-1)  # Shape: (84, 84)
         self.frames = [obs] * self.num_stack
-        return np.stack(self.frames, axis=0), info
+        return np.stack(self.frames, axis=0), info  # Shape: (4, 84, 84)
 
     def step(self, action):
         result = self.env.step(action)
         obs, reward, terminated, truncated, info = result
-        obs = np.array(obs, dtype=np.uint8)
+        obs = np.array(obs, dtype=np.uint8)  # Shape: (84, 84, 1)
+        obs = obs.squeeze(-1)  # Shape: (84, 84)
         self.frames.pop(0)
         self.frames.append(obs)
-        return np.stack(self.frames, axis=0), reward, terminated, truncated, info
+        return np.stack(self.frames, axis=0), reward, terminated, truncated, info  # Shape: (4, 84, 84)
 
 # ResizeObservation (unchanged)
 class ResizeObservation(Wrapper):
@@ -260,13 +262,13 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
     # Warmup phase
     print("Starting warmup phase...")
     state, info = env.reset()
-    state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0  # Fix: (4, 84, 84, 1) -> (4, 1, 84, 84)
+    state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0  # Shape: (4, 84, 84)
     with tqdm(total=warmup_steps, desc="Warmup Steps") as pbar:
         while steps_done < warmup_steps:
             action = env.action_space.sample()
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-            next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0
+            next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device) / 255.0
             reward = np.clip(reward, -1, 1)
             gamma_val = 0.0 if done else gamma
             memory.push(state.cpu().numpy(), action, next_state.cpu().numpy(), reward, done, gamma_val)
@@ -275,7 +277,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
             pbar.update(1)
             if done:
                 state, info = env.reset()
-                state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0
+                state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0
     print("Warmup phase completed.")
 
     # Main training loop
@@ -285,19 +287,19 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                 if isinstance(module, NoisyLinear):
                     module.reset_noise()
             state, info = env.reset()
-            state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0
+            state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0
             episode_reward = 0
             done = False
 
             while not done:
                 with torch.no_grad():
-                    state_batched = state.unsqueeze(0)
+                    state_batched = state.unsqueeze(0)  # Shape: (1, 4, 84, 84)
                     probs = policy_net(state_batched)
                     q_values = (probs * z).sum(dim=-1)
                     action = q_values.argmax(dim=1).item()
                 next_state, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
-                next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0
+                next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device) / 255.0
                 reward = np.clip(reward, -1, 1)
                 gamma_val = 0.0 if done else gamma
                 episode_reward += reward
@@ -308,12 +310,10 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                 if len(memory.buffer) >= batch_size and steps_done % 4 == 0:
                     transitions, indices, weights = memory.sample(batch_size, beta=get_beta(steps_done, args.total_steps))
                     batch = Transition(*zip(*transitions))
-                    states = torch.tensor(np.array(batch.state), dtype=torch.float32, device=device)
-                    states = states.permute(0, 1, 4, 2, 3)  # Fix: (batch, 4, 84, 84, 1) -> (batch, 4, 1, 84, 84)
+                    states = torch.tensor(np.array(batch.state), dtype=torch.float32, device=device) / 255.0  # Shape: (batch, 4, 84, 84)
                     actions = torch.tensor(batch.action, device=device)
                     rewards = torch.tensor(batch.reward, device=device)
-                    next_states = torch.tensor(np.array(batch.next_state), dtype=torch.float32, device=device)
-                    next_states = next_states.permute(0, 1, 4, 2, 3)
+                    next_states = torch.tensor(np.array(batch.next_state), dtype=torch.float32, device=device) / 255.0
                     dones = torch.tensor(batch.done, device=device, dtype=torch.float32)
                     gammas = torch.tensor(batch.gamma, device=device)
 
@@ -380,18 +380,18 @@ def evaluate_agent(env, policy_net, args):
             if isinstance(module, NoisyLinear):
                 module.reset_noise()
         state, info = env.reset()
-        state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0  # Fix: (4, 84, 84, 1) -> (4, 1, 84, 84)
+        state = torch.tensor(np.array(state), dtype=torch.float32, device=device) / 255.0  # Shape: (4, 84, 84)
         total_reward = 0
         done = False
         while not done:
             with torch.no_grad():
-                state_batched = state.unsqueeze(0)
+                state_batched = state.unsqueeze(0)  # Shape: (1, 4, 84, 84)
                 probs = policy_net(state_batched)
                 q_values = (probs * z).sum(dim=-1)
                 action = q_values.argmax(dim=1).item()
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-            state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0
+            state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device) / 255.0
             reward = np.clip(reward, -1, 1)
             total_reward += reward
         print(f"Evaluation Episode {episode + 1}, Reward: {total_reward:.2f}, x_pos: {info.get('x_pos', 0)}, coins: {info.get('coins', 0)}, time: {info.get('time', 400)}, flag_get: {info.get('flag_get', False)}")
