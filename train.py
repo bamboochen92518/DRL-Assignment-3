@@ -73,7 +73,7 @@ class ActionRepeatWrapper(Wrapper):
         self.step_count = 0
         return self.env.reset(**kwargs)
 
-# ResetCompatibilityWrapper (unchanged)
+# ResetCompatibilityWrapper (modified)
 class ResetCompatibilityWrapper(Wrapper):
     def reset(self, **kwargs):
         result = self.env.reset(**kwargs)
@@ -86,6 +86,9 @@ class ResetCompatibilityWrapper(Wrapper):
             obs = obs[..., :3]
         elif len(obs.shape) == 2:
             obs = np.stack([obs] * 3, axis=-1)
+        # Return only obs for FrameStack, tuple for outer env
+        if 'frame_stack' in str(self.env):  # Detect if called by FrameStack
+            return obs
         return obs, info
 
     def step(self, action):
@@ -366,7 +369,7 @@ def evaluate_agent(env, policy_net, args):
             total_reward += reward
         print(f"Evaluation Episode {episode + 1}, Reward: {total_reward:.2f}, x_pos: {info.get('x_pos', 0)}, coins: {info.get('coins', 0)}, time: {info.get('time', 400)}, flag_get: {info.get('flag_get', False)}")
 
-# main (updated to fix error)
+# main (updated)
 def main():
     parser = argparse.ArgumentParser(description="Rainbow DQN for Super Mario Bros")
     parser.add_argument("--num_episodes", type=int, default=1000, help="Number of training episodes")
