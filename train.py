@@ -73,7 +73,7 @@ class ActionRepeatWrapper(Wrapper):
         self.step_count = 0
         return self.env.reset(**kwargs)
 
-# ResetCompatibilityWrapper (modified)
+# ResetCompatibilityWrapper (unchanged)
 class ResetCompatibilityWrapper(Wrapper):
     def reset(self, **kwargs):
         result = self.env.reset(**kwargs)
@@ -86,7 +86,6 @@ class ResetCompatibilityWrapper(Wrapper):
             obs = obs[..., :3]
         elif len(obs.shape) == 2:
             obs = np.stack([obs] * 3, axis=-1)
-        # Return obs for inner wrappers, tuple for outer env
         if isinstance(self.env, (FrameStack, CustomFrameStack)):
             return obs
         return obs, info
@@ -109,13 +108,13 @@ class ResetCompatibilityWrapper(Wrapper):
             obs = np.stack([obs] * 3, axis=-1)
         return obs, reward, terminated, truncated, info
 
-# CustomFrameStack (new)
+# CustomFrameStack (unchanged)
 class CustomFrameStack(Wrapper):
     def __init__(self, env, num_stack=4):
         super().__init__(env)
         self.num_stack = num_stack
         self.frames = [None] * num_stack
-        self.lz4_compress = False  # Disable for simplicity
+        self.lz4_compress = False
 
     def reset(self, **kwargs):
         result = self.env.reset(**kwargs)
@@ -241,7 +240,7 @@ def get_beta(step, total_steps, beta_start=0.4, beta_end=1.0):
     fraction = min(1.0, step / total_steps)
     return beta_start + fraction * (beta_end - beta_start)
 
-# train_rainbow_dqn (unchanged)
+# train_rainbow_dqn (modified)
 def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
     num_actions = env.action_space.n
     num_atoms = args.num_atoms
@@ -261,13 +260,13 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
     # Warmup phase
     print("Starting warmup phase...")
     state, info = env.reset()
-    state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+    state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0  # Fix: (4, 84, 84, 1) -> (4, 1, 84, 84)
     with tqdm(total=warmup_steps, desc="Warmup Steps") as pbar:
         while steps_done < warmup_steps:
             action = env.action_space.sample()
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-            next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+            next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0
             reward = np.clip(reward, -1, 1)
             gamma_val = 0.0 if done else gamma
             memory.push(state.cpu().numpy(), action, next_state.cpu().numpy(), reward, done, gamma_val)
@@ -276,7 +275,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
             pbar.update(1)
             if done:
                 state, info = env.reset()
-                state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+                state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0
     print("Warmup phase completed.")
 
     # Main training loop
@@ -286,7 +285,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                 if isinstance(module, NoisyLinear):
                     module.reset_noise()
             state, info = env.reset()
-            state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+            state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0
             episode_reward = 0
             done = False
 
@@ -298,7 +297,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                     action = q_values.argmax(dim=1).item()
                 next_state, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
-                next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+                next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0
                 reward = np.clip(reward, -1, 1)
                 gamma_val = 0.0 if done else gamma
                 episode_reward += reward
@@ -310,9 +309,11 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                     transitions, indices, weights = memory.sample(batch_size, beta=get_beta(steps_done, args.total_steps))
                     batch = Transition(*zip(*transitions))
                     states = torch.tensor(np.array(batch.state), dtype=torch.float32, device=device)
+                    states = states.permute(0, 1, 4, 2, 3)  # Fix: (batch, 4, 84, 84, 1) -> (batch, 4, 1, 84, 84)
                     actions = torch.tensor(batch.action, device=device)
                     rewards = torch.tensor(batch.reward, device=device)
                     next_states = torch.tensor(np.array(batch.next_state), dtype=torch.float32, device=device)
+                    next_states = next_states.permute(0, 1, 4, 2, 3)
                     dones = torch.tensor(batch.done, device=device, dtype=torch.float32)
                     gammas = torch.tensor(batch.gamma, device=device)
 
@@ -366,7 +367,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
 
     return policy_net
 
-# evaluate_agent (unchanged)
+# evaluate_agent (modified)
 def evaluate_agent(env, policy_net, args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_atoms = args.num_atoms
@@ -379,7 +380,7 @@ def evaluate_agent(env, policy_net, args):
             if isinstance(module, NoisyLinear):
                 module.reset_noise()
         state, info = env.reset()
-        state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+        state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0  # Fix: (4, 84, 84, 1) -> (4, 1, 84, 84)
         total_reward = 0
         done = False
         while not done:
@@ -390,12 +391,12 @@ def evaluate_agent(env, policy_net, args):
                 action = q_values.argmax(dim=1).item()
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-            state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+            state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(0, 3, 1, 2) / 255.0
             reward = np.clip(reward, -1, 1)
             total_reward += reward
         print(f"Evaluation Episode {episode + 1}, Reward: {total_reward:.2f}, x_pos: {info.get('x_pos', 0)}, coins: {info.get('coins', 0)}, time: {info.get('time', 400)}, flag_get: {info.get('flag_get', False)}")
 
-# main (updated)
+# main (modified)
 def main():
     parser = argparse.ArgumentParser(description="Rainbow DQN for Super Mario Bros")
     parser.add_argument("--num_episodes", type=int, default=1000, help="Number of training episodes")
@@ -426,7 +427,7 @@ def main():
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     env = ResetCompatibilityWrapper(env)
     env = ResizeObservation(env, shape=(args.resize_shape, args.resize_shape))
-    env = CustomFrameStack(env, num_stack=4)  # Use CustomFrameStack
+    env = CustomFrameStack(env, num_stack=4)
     env = ActionRepeatWrapper(env, repeat=4)
 
     # Set up device
