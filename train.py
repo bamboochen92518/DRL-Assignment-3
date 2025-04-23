@@ -86,8 +86,8 @@ class ResetCompatibilityWrapper(Wrapper):
             obs = obs[..., :3]
         elif len(obs.shape) == 2:
             obs = np.stack([obs] * 3, axis=-1)
-        # Return only obs for FrameStack, tuple for outer env
-        if 'frame_stack' in str(self.env):  # Detect if called by FrameStack
+        # Return obs for inner wrappers, tuple for outer env
+        if isinstance(self.env, (FrameStack, CustomFrameStack)):
             return obs
         return obs, info
 
@@ -109,10 +109,36 @@ class ResetCompatibilityWrapper(Wrapper):
             obs = np.stack([obs] * 3, axis=-1)
         return obs, reward, terminated, truncated, info
 
+# CustomFrameStack (new)
+class CustomFrameStack(Wrapper):
+    def __init__(self, env, num_stack=4):
+        super().__init__(env)
+        self.num_stack = num_stack
+        self.frames = [None] * num_stack
+        self.lz4_compress = False  # Disable for simplicity
+
+    def reset(self, **kwargs):
+        result = self.env.reset(**kwargs)
+        if isinstance(result, tuple):
+            obs, info = result
+        else:
+            obs, info = result, {}
+        obs = np.array(obs, dtype=np.uint8)
+        self.frames = [obs] * self.num_stack
+        return np.stack(self.frames, axis=0), info
+
+    def step(self, action):
+        result = self.env.step(action)
+        obs, reward, terminated, truncated, info = result
+        obs = np.array(obs, dtype=np.uint8)
+        self.frames.pop(0)
+        self.frames.append(obs)
+        return np.stack(self.frames, axis=0), reward, terminated, truncated, info
+
 # ResizeObservation (unchanged)
 class ResizeObservation(Wrapper):
     def __init__(self, env, shape):
-        super(ResizeObservation, self).__init__(env)
+        super().__init__(env)
         self.shape = shape
 
     def reset(self, **kwargs):
@@ -400,7 +426,7 @@ def main():
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     env = ResetCompatibilityWrapper(env)
     env = ResizeObservation(env, shape=(args.resize_shape, args.resize_shape))
-    env = FrameStack(env, num_stack=4)
+    env = CustomFrameStack(env, num_stack=4)  # Use CustomFrameStack
     env = ActionRepeatWrapper(env, repeat=4)
 
     # Set up device
