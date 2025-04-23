@@ -14,8 +14,17 @@ from tqdm import tqdm
 import argparse
 import cv2
 import math
+from dataclasses import dataclass
 
-# Your NoisyLinear Implementation (with b_epsilon fix)
+# Config for QNet (removed noisy parameter)
+@dataclass
+class Config:
+    dueling: bool = True
+    distributional_atom_size: int = 51
+    distributional_v_min: float = -10.0
+    distributional_v_max: float = 10.0
+
+# NoisyLinear (from previous submission, with b_epsilon fix)
 class NoisyLinear(torch.nn.Module):
     def __init__(self, in_features, out_features, std_init=0.5):
         super(NoisyLinear, self).__init__()
@@ -53,7 +62,66 @@ class NoisyLinear(torch.nn.Module):
         in_epsilon = self._noise_func(self.in_features)
         out_epsilon = self._noise_func(self.out_features)
         self.w_epsilon.copy_(out_epsilon.ger(in_epsilon))
-        self.b_epsilon.copy_(self._noise_func(self.out_features))  # Fixed bug
+        self.b_epsilon.copy_(self._noise_func(self.out_features))
+
+# QNet (modified to fix NoisyLinear usage, removed config.noisy)
+class QNet(torch.nn.Module):
+    def __init__(self, n_observations, n_actions, config):
+        super(QNet, self).__init__()
+        self.n_observations = n_observations
+        self.n_actions = n_actions
+        self.config = config
+
+        self.layer1 = torch.nn.Linear(n_observations, 320)
+        if self.config.dueling:
+            self.layer_v = NoisyLinear(320, self.config.distributional_atom_size)
+            self.layer_a = NoisyLinear(320, n_actions * self.config.distributional_atom_size)
+        else:
+            self.layer_q = NoisyLinear(320, n_actions * self.config.distributional_atom_size)
+
+        if self.config.distributional_atom_size > 1:
+            self.support_z = torch.linspace(self.config.distributional_v_min, self.config.distributional_v_max, self.config.distributional_atom_size)
+
+    def forward(self, batch_state, return_dist=False):
+        x = torch.relu(self.layer1(batch_state))
+        if self.config.dueling:
+            v = self.layer_v(x)
+            a = self.layer_a(x)
+            if self.config.distributional_atom_size <= 1:
+                return v + a - a.mean()
+
+            v = v.view(-1, 1, self.config.distributional_atom_size)
+            a = a.view(-1, self.n_actions, self.config.distributional_atom_size)
+            q_atoms = v + a - a.mean(dim=1, keepdim=True)
+            dist = torch.softmax(q_atoms, dim=-1).clamp(min=1e-3)
+        else:
+            q = self.layer_q(x)
+            if self.config.distributional_atom_size <= 1:
+                return q
+            q = q.view(-1, self.n_actions, self.config.distributional_atom_size)
+            dist = torch.softmax(q, dim=-1).clamp(min=1e-3)
+
+        if return_dist:
+            return dist
+
+        return torch.sum(dist * self.support_z, dim=2)
+
+    def reset_noise(self):
+        if self.config.dueling:
+            self.layer_v.reset_noise()
+            self.layer_a.reset_noise()
+        else:
+            self.layer_q.reset_noise()
+
+    def zero_noise(self):
+        if self.config.dueling:
+            self.layer_v.w_epsilon.zero_()
+            self.layer_v.b_epsilon.zero_()
+            self.layer_a.w_epsilon.zero_()
+            self.layer_a.b_epsilon.zero_()
+        else:
+            self.layer_q.w_epsilon.zero_()
+            self.layer_q.b_epsilon.zero_()
 
 # Compatibility Wrapper for Old Gym API
 class ResetCompatibilityWrapper(Wrapper):
@@ -109,46 +177,6 @@ class ResizeObservation(Wrapper):
         obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
         obs = np.expand_dims(obs, axis=-1)
         return obs
-
-# Dueling Categorical DQN
-class DuelingCategoricalDQN(nn.Module):
-    def __init__(self, input_shape, num_actions=12, num_atoms=51, V_min=-10, V_max=10):
-        super(DuelingCategoricalDQN, self).__init__()
-        self.num_actions = num_actions
-        self.num_atoms = num_atoms
-        self.V_min = V_min
-        self.V_max = V_max
-        self.conv = nn.Sequential(
-            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU()
-        )
-        conv_out_size = self._get_conv_out(input_shape)
-        self.fc_value = nn.Sequential(
-            NoisyLinear(conv_out_size, 512, std_init=0.5),
-            nn.ReLU(),
-            NoisyLinear(512, num_atoms, std_init=0.5)
-        )
-        self.fc_advantage = nn.Sequential(
-            NoisyLinear(conv_out_size, 512, std_init=0.5),
-            nn.ReLU(),
-            NoisyLinear(512, num_actions * num_atoms, std_init=0.5)
-        )
-
-    def _get_conv_out(self, shape):
-        o = self.conv(torch.zeros(1, *shape))
-        return int(np.prod(o.size()))
-
-    def forward(self, x):
-        batch_size = x.size(0)
-        conv_out = self.conv(x).view(batch_size, -1)
-        value = self.fc_value(conv_out).view(batch_size, 1, self.num_atoms)
-        advantage = self.fc_advantage(conv_out).view(batch_size, self.num_actions, self.num_atoms)
-        probs = value + (advantage - advantage.mean(dim=1, keepdim=True))
-        return torch.softmax(probs, dim=-1)
 
 # Prioritized Replay Buffer
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'done'))
@@ -209,13 +237,13 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
     # Warmup phase: fill replay buffer with random actions
     print("Starting warmup phase...")
     state, info = env.reset()
-    state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+    state = torch.tensor(np.array(state), dtype=torch.float32, device=device).flatten(start_dim=1) / 255.0
     with tqdm(total=warmup_steps, desc="Warmup Steps") as pbar:
         while steps_done < warmup_steps:
             action = env.action_space.sample()
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-            next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+            next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).flatten(start_dim=1) / 255.0
             reward = np.clip(reward, -1, 1)  # Clip reward to [-1, 1]
             memory.push(state.cpu().numpy(), action, next_state.cpu().numpy(), reward, done)
             state = next_state
@@ -223,30 +251,26 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
             pbar.update(1)
             if done:
                 state, info = env.reset()
-                state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+                state = torch.tensor(np.array(state), dtype=torch.float32, device=device).flatten(start_dim=1) / 255.0
     print("Warmup phase completed.")
 
     # Main training loop
     with tqdm(range(args.num_episodes), desc="Training Episodes", unit="episode") as pbar:
         for episode in pbar:
-            # Reset noise for all NoisyLinear layers
-            for module in policy_net.modules():
-                if isinstance(module, NoisyLinear):
-                    module.reset_noise()
+            policy_net.reset_noise()
             state, info = env.reset()
-            state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+            state = torch.tensor(np.array(state), dtype=torch.float32, device=device).flatten(start_dim=1) / 255.0
             episode_reward = 0
             done = False
 
             while not done:
                 with torch.no_grad():
-                    state_batched = state.unsqueeze(0)  # Add batch dimension for network
-                    probs = policy_net(state_batched)
-                    q_values = (probs * z).sum(dim=-1)
+                    state_batched = state  # Already flat
+                    q_values = policy_net(state_batched)
                     action = q_values.argmax(dim=1).item()
                 next_state, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
-                next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+                next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).flatten(start_dim=1) / 255.0
                 reward = np.clip(reward, -1, 1)  # Clip reward to [-1, 1]
                 # Optional reward shaping
                 # shaped_reward = reward + info.get('x_pos', 0) * 0.01
@@ -265,8 +289,8 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                     dones = torch.tensor(batch.done, device=device, dtype=torch.float32)
 
                     with torch.no_grad():
-                        next_probs = target_net(next_states)
-                        next_q = (probs * z).sum(dim=-1)
+                        next_probs = target_net(next_states, return_dist=True)
+                        next_q = torch.sum(next_probs * z, dim=-1)
                         next_action = next_q.argmax(dim=1)
                         target_probs = next_probs[range(batch_size), next_action]
                         target_z = rewards.unsqueeze(1) + (gamma ** n_step) * z.unsqueeze(0) * (1 - dones).unsqueeze(1)
@@ -282,7 +306,6 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                         u_clamped = u.clamp(0, num_atoms - 1)
                         m_flat = m.view(-1)
 
-                        # Explicitly cast indices and source
                         l_indices = (l_clamped + offset).view(-1).long()
                         u_indices = (u_clamped + offset).view(-1).long()
                         l_source = (target_probs * (u.float() - b)).view(-1).float()
@@ -291,7 +314,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                         m_flat.index_add_(0, l_indices, l_source)
                         m_flat.index_add_(0, u_indices, u_source)
 
-                    probs = policy_net(states)[range(batch_size), actions]
+                    probs = policy_net(states, return_dist=True)[range(batch_size), actions]
                     loss = -(m * torch.log(probs + 1e-10)).sum(dim=-1)  # Shape: [batch_size]
                     weighted_loss = torch.tensor(weights, device=device) * loss
                     priorities = weighted_loss.abs().detach().cpu().numpy() + 1e-5  # Shape: [batch_size]
@@ -327,23 +350,19 @@ def evaluate_agent(env, policy_net, args):
     z = torch.linspace(V_min, V_max, num_atoms).to(device)
 
     for episode in tqdm(range(args.num_eval_episodes), desc="Evaluation Episodes"):
-        # Reset noise for evaluation
-        for module in policy_net.modules():
-            if isinstance(module, NoisyLinear):
-                module.reset_noise()
+        policy_net.zero_noise()  # Deterministic evaluation
         state, info = env.reset()
-        state = torch.tensor(np.array(state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+        state = torch.tensor(np.array(state), dtype=torch.float32, device=device).flatten(start_dim=1) / 255.0
         total_reward = 0
         done = False
         while not done:
             with torch.no_grad():
-                state_batched = state.unsqueeze(0)  # Add batch dimension for network
-                probs = policy_net(state_batched)
-                q_values = (probs * z).sum(dim=-1)
+                state_batched = state
+                q_values = policy_net(state_batched)
                 action = q_values.argmax(dim=1).item()
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-            state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+            state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).flatten(start_dim=1) / 255.0
             reward = np.clip(reward, -1, 1)  # Clip reward to [-1, 1]
             # Optional reward shaping
             # shaped_reward = reward + info.get('x_pos', 0) * 0.01
@@ -392,8 +411,11 @@ def main():
     print(f"Observation: type={type(obs)}, shape={obs.shape if isinstance(obs, np.ndarray) else 'N/A'}, dtype={obs.dtype if isinstance(obs, np.ndarray) else 'N/A'}")
 
     # Initialize networks
-    policy_net = DuelingCategoricalDQN((1, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
-    target_net = DuelingCategoricalDQN((1, args.resize_shape, args.resize_shape), num_actions=env.action_space.n, num_atoms=args.num_atoms, V_min=args.V_min, V_max=args.V_max).to(device)
+    config = Config(dueling=True, distributional_atom_size=args.num_atoms, distributional_v_min=args.V_min, distributional_v_max=args.V_max)
+    policy_net = QNet(n_observations=args.resize_shape * args.resize_shape * 1, n_actions=env.action_space.n, config=config).to(device)
+    target_net = QNet(n_observations=args.resize_shape * args.resize_shape * 1, n_actions=env.action_space.n, config=config).to(device)
+    policy_net.support_z = policy_net.support_z.to(device)
+    target_net.support_z = target_net.support_z.to(device)
     target_net.load_state_dict(policy_net.state_dict())
     optimizer = optim.Adam(policy_net.parameters(), lr=args.lr, eps=args.eps)
     memory = PrioritizedReplayBuffer(capacity=args.memory_capacity, alpha=args.alpha)
