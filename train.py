@@ -262,13 +262,6 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                         u_clamped = u.clamp(0, num_atoms - 1)
                         m_flat = m.view(-1)
 
-                        # Debug tensor types and devices
-                        print(f"m_flat: dtype={m_flat.dtype}, device={m_flat.device}")
-                        print(f"l_clamped + offset: dtype={(l_clamped + offset).dtype}, device={(l_clamped + offset).device}")
-                        print(f"u_clamped + offset: dtype={(u_clamped + offset).dtype}, device={(u_clamped + offset).device}")
-                        print(f"target_probs * (u.float() - b): dtype={(target_probs * (u.float() - b)).dtype}, device={(target_probs * (u.float() - b)).device}")
-                        print(f"target_probs * (b - l.float()): dtype={(target_probs * (b - l.float())).dtype}, device={(target_probs * (b - l.float())).device}")
-
                         # Explicitly cast indices to long and ensure source is float
                         l_indices = (l_clamped + offset).view(-1).long()
                         u_indices = (u_clamped + offset).view(-1).long()
