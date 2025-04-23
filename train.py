@@ -221,6 +221,8 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args):
                 next_state, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
                 next_state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+                # Optional reward shaping
+                # shaped_reward = reward + info.get('x_pos', 0) * 0.01
                 episode_reward += reward
                 memory.push(state.cpu().numpy(), action, next_state.cpu().numpy(), reward, done)
                 state = next_state
@@ -297,7 +299,6 @@ def evaluate_agent(env, policy_net, args):
         total_reward = 0
         done = False
         while not done:
-            env.render()
             with torch.no_grad():
                 state_batched = state.unsqueeze(0)  # Add batch dimension for network
                 probs = policy_net(state_batched)
@@ -306,8 +307,10 @@ def evaluate_agent(env, policy_net, args):
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             state = torch.tensor(np.array(next_state), dtype=torch.float32, device=device).permute(2, 0, 1) / 255.0
+            # Optional reward shaping
+            # shaped_reward = reward + info.get('x_pos', 0) * 0.01
             total_reward += reward
-        print(f"Evaluation Episode {episode + 1}, Reward: {total_reward:.2f}")
+        print(f"Evaluation Episode {episode + 1}, Reward: {total_reward:.2f}, x_pos: {info.get('x_pos', 0)}, coins: {info.get('coins', 0)}, time: {info.get('time', 400)}, flag_get: {info.get('flag_get', False)}")
 
 # Main Function
 def main():
