@@ -368,9 +368,9 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
 
             history_rewards.append(episode_reward)
             pbar.set_postfix({"Reward": f"{episode_reward:.2f}"})
-            if (episode + 1) % 100 == 0:
-                avg_reward = np.mean(history_rewards[-100:]) if len(history_rewards) >= 100 else np.mean(history_rewards)
-                print(f"Episode {episode + 1}/{args.num_episodes}, Avg Reward (last 100): {avg_reward:.2f}")
+            if (episode + 1) % args.checkpoint_interval == 0:
+                avg_reward = np.mean(history_rewards[-args.checkpoint_interval:]) if len(history_rewards) >= args.checkpoint_interval else np.mean(history_rewards)
+                print(f"Episode {episode + 1}/{args.num_episodes}, Avg Reward (last {args.checkpoint_interval}): {avg_reward:.2f}")
                 try:
                     os.makedirs("checkpoints", exist_ok=True)
                     checkpoint = {
@@ -414,7 +414,7 @@ def evaluate_agent(env, policy_net, args):
             total_reward += reward
         print(f"Evaluation Episode {episode + 1}, Reward: {total_reward:.2f}, x_pos: {info.get('x_pos', 0)}, coins: {info.get('coins', 0)}, time: {info.get('time', 400)}, flag_get: {info.get('flag_get', False)}")
 
-# load_checkpoint (modified)
+# load_checkpoint (unchanged)
 def load_checkpoint(model, checkpoint_path, device):
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -453,11 +453,14 @@ def main():
     parser.add_argument("--resize_shape", type=int, default=84, help="Size for resizing observations")
     parser.add_argument("--total_steps", type=int, default=10000000, help="Total steps for beta annealing")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to checkpoint file to load (optional)")
+    parser.add_argument("--checkpoint_interval", type=int, default=100, help="Interval (in episodes) to save checkpoints and evaluate")
     args = parser.parse_args()
 
-    # Validate resize_shape
+    # Validate arguments
     if args.resize_shape <= 0:
         raise ValueError("resize_shape must be a positive integer")
+    if args.checkpoint_interval <= 0:
+        raise ValueError("checkpoint_interval must be a positive integer")
 
     # Set up environment
     env = gym_super_mario_bros.make('SuperMarioBros-1-1-v0')
