@@ -2,776 +2,427 @@ import gym
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
 from nes_py.wrappers import JoypadSpace
-from gym import Wrapper
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-import os
-from collections import namedtuple, defaultdict
+from collections import deque, namedtuple
 import random
-from tqdm import tqdm
+import os
+from torchvision import transforms as T
+from gym.wrappers import TimeLimit
 import argparse
-import cv2
-import math
-from gym.wrappers import FrameStack
+from tqdm import tqdm
 import psutil
-import gc
 
-# SumTree (unchanged)
-class SumTree:
-    def __init__(self, capacity):
-        self.capacity = 1
-        while self.capacity < capacity:
-            self.capacity *= 2
-
-        self.tree = defaultdict(float)
-        self.dataset = {}
-
-        self.leaf_idx_offset = self.capacity - 1
-        self.tree_leaf_pos = 0
-
-        self.length = 0
-        self.min_priority, self.max_priority = 1.0, 1.0
-
-    def __len__(self):
-        return self.length
-
-    def add(self, data, priority=None):
-        self.length = min(self.length + 1, self.capacity)
-
-        if priority is None:
-            priority = self.max_priority
-        elif priority > self.max_priority:
-            self.max_priority = priority
-        if priority < self.min_priority:
-            self.min_priority = priority
-
-        leaf_real_idx = self.leaf_idx_offset + self.tree_leaf_pos
-        state, action, reward, next_state, done = data
-        self.dataset[leaf_real_idx] = (
-            state,
-            np.int16(action),
-            float(reward),
-            next_state,
-            bool(done)
-        )
-
-        self.update_priority(leaf_real_idx, priority)
-
-        self.tree_leaf_pos += 1
-        self.tree_leaf_pos %= self.capacity
-
-    def update_priority(self, leaf_real_idx, priority):
-        self.tree[leaf_real_idx] = priority
-
-        while True:
-            parent_idx = (leaf_real_idx - 1) // 2
-            if leaf_real_idx % 2 == 0:
-                self.tree[parent_idx] = self.tree[leaf_real_idx - 1] + self.tree[leaf_real_idx]
-            else:
-                self.tree[parent_idx] = self.tree[leaf_real_idx] + self.tree[leaf_real_idx + 1]
-            leaf_real_idx = parent_idx
-            if parent_idx == 0:
-                break
-
-    def sample(self, batch_size, n_step=1):
-        seg = self.tree[0] / batch_size
-        batch_data_idx = []
-        for i in range(batch_size):
-            rnd_value = random.uniform(a=seg * i, b=seg * (i + 1))
-            son_idx = 1
-            while True:
-                if self.tree[son_idx] < rnd_value:
-                    rnd_value -= self.tree[son_idx]
-                    son_idx += 1
-
-                if son_idx >= self.leaf_idx_offset:
-                    break
-
-                son_idx = son_idx * 2 + 1
-
-            batch_data_idx.append(son_idx)
-
-        batch_seq_data = []
-        for idx in batch_data_idx:
-            seq_data = [self.dataset[idx]]
-            while len(seq_data) < n_step:
-                done = seq_data[-1][4]
-                if done:
-                    break
-
-                next_leaf_idx = self.leaf_idx_offset + (idx + len(seq_data) - self.leaf_idx_offset) % self.capacity
-                if next_leaf_idx not in self.dataset:
-                    break
-                seq_data.append(self.dataset[next_leaf_idx])
-            batch_seq_data.append(seq_data)
-
-        return batch_data_idx, batch_seq_data, [self.tree[idx] for idx in batch_data_idx]
-
-# NoisyLinear (unchanged)
-class NoisyLinear(torch.nn.Module):
-    def __init__(self, in_features, out_features, std_init):
-        super(NoisyLinear, self).__init__()
-        self.in_features, self.out_features, self.std_init = in_features, out_features, std_init
-        self.w_mu = torch.nn.Parameter(torch.Tensor(out_features, in_features))
-        self.w_sigma = torch.nn.Parameter(torch.Tensor(out_features, in_features))
-        self.b_mu = torch.nn.Parameter(torch.Tensor(out_features))
-        self.b_sigma = torch.nn.Parameter(torch.Tensor(out_features))
-        self.register_buffer('w_epsilon', torch.Tensor(out_features, in_features))
-        self.register_buffer('b_epsilon', torch.Tensor(out_features))
-        self.init_parameters()
-        self.reset_noise()
-
-    def forward(self, x):
-        return torch.nn.functional.linear(x,
-                                          self.w_mu + self.w_sigma * self.w_epsilon,
-                                          self.b_mu + self.b_sigma * self.b_epsilon)
-
-    def init_parameters(self):
-        mu_range = 1 / math.sqrt(self.in_features)
-        self.w_mu.data.uniform_(-mu_range, mu_range)
-        self.b_mu.data.uniform_(-mu_range, mu_range)
-        self.w_sigma.data.fill_(self.std_init / math.sqrt(self.in_features))
-        self.b_sigma.data.fill_(self.std_init / math.sqrt(self.out_features))
-
-    def _noise_func(self, size):
-        x = torch.randn(size)
-        return x.sign().mul(x.abs().sqrt())
-
-    def reset_noise(self):
-        in_epsilon = self._noise_func(self.in_features)
-        out_epsilon = self._noise_func(self.out_features)
-        self.w_epsilon.copy_(out_epsilon.ger(in_epsilon))
-        self.b_epsilon.copy_(self._noise_func(self.out_features))
-
-# ActionRepeatWrapper (unchanged)
-class ActionRepeatWrapper(Wrapper):
-    def __init__(self, env, repeat=4):
+# Environment Wrappers
+class SkipFrame(gym.Wrapper):
+    def __init__(self, env, skip):
         super().__init__(env)
-        self.repeat = repeat
-        self.step_count = 0
-
+        self._skip = skip
     def step(self, action):
-        total_reward = 0.0
-        for _ in range(self.repeat):
-            obs, reward, done, truncated, info = self.env.step(action)
+        total_reward, done = 0.0, False
+        for _ in range(self._skip):
+            obs, reward, done, info = self.env.step(action)
             total_reward += reward
-            self.step_count += 1
-            if done or truncated:
-                break
-        return obs, total_reward, done, truncated, info
+            if done: break
+        return obs, total_reward, done, info
 
-    def reset(self, **kwargs):
-        self.step_count = 0
-        return self.env.reset(**kwargs)
-
-# ResetCompatibilityWrapper (unchanged)
-class ResetCompatibilityWrapper(Wrapper):
-    def reset(self, **kwargs):
-        result = self.env.reset(**kwargs)
-        if isinstance(result, tuple):
-            obs, info = result
-        else:
-            obs, info = result, {}
-        obs = np.array(obs, dtype=np.uint8)
-        if len(obs.shape) == 3 and obs.shape[-1] == 4:
-            obs = obs[..., :3]
-        if len(obs.shape) == 2:
-            obs = np.expand_dims(obs, axis=-1)
-        if isinstance(self.env, (FrameStack, CustomFrameStack)):
-            return obs
-        return obs, info
-
-    def step(self, action):
-        result = self.env.step(action)
-        if len(result) == 4:
-            obs, reward, done, info = result
-            obs = np.array(obs, dtype=np.uint8)
-            if len(obs.shape) == 3 and obs.shape[-1] == 4:
-                obs = obs[..., :3]
-            if len(obs.shape) == 2:
-                obs = np.expand_dims(obs, axis=-1)
-            return obs, reward, done, False, info
-        obs, reward, terminated, truncated, info = result
-        obs = np.array(obs, dtype=np.uint8)
-        if len(obs.shape) == 3 and obs.shape[-1] == 4:
-            obs = obs[..., :3]
-        if len(obs.shape) == 2:
-            obs = np.expand_dims(obs, axis=-1)
-        return obs, reward, terminated, truncated, info
-
-# CustomFrameStack (unchanged)
-class CustomFrameStack(Wrapper):
-    def __init__(self, env, num_stack=4):
+class GrayScaleResize(gym.ObservationWrapper):
+    def __init__(self, env):
         super().__init__(env)
-        self.num_stack = num_stack
-        self.frames = [None] * num_stack
-        self.lz4_compress = False
+        self.transform = T.Compose([
+            T.ToPILImage(), T.Grayscale(), T.Resize((84, 90)), T.ToTensor()
+        ])
+        self.observation_space = gym.spaces.Box(0.0, 1.0, shape=(1, 84, 90), dtype=np.float32)
+    def observation(self, obs):
+        return self.transform(obs)
 
-    def reset(self, **kwargs):
-        result = self.env.reset(**kwargs)
-        if isinstance(result, tuple):
-            obs, info = result
-        else:
-            obs, info = result, {}
-        obs = np.array(obs, dtype=np.uint8)
-        if obs.shape[-1] == 3:
-            obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-            obs = np.expand_dims(obs, axis=-1)
-        self.frames = [obs] * self.num_stack
-        return np.stack(self.frames, axis=0), info
-
+class FrameStack(gym.Wrapper):
+    def __init__(self, env, k):
+        super().__init__(env)
+        self.k = k
+        self.frames = deque(maxlen=k)
+        shp = env.observation_space.shape
+        self.observation_space = gym.spaces.Box(0, 1, shape=(shp[0]*k, shp[1], shp[2]), dtype=np.float32)
+    def reset(self):
+        obs = self.env.reset()
+        for _ in range(self.k): self.frames.append(obs)
+        return np.concatenate(self.frames, axis=0)
     def step(self, action):
-        result = self.env.step(action)
-        obs, reward, terminated, truncated, info = result
-        obs = np.array(obs, dtype=np.uint8)
-        if obs.shape[-1] == 3:
-            obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-            obs = np.expand_dims(obs, axis=-1)
-        self.frames.pop(0)
+        obs, r, done, info = self.env.step(action)
         self.frames.append(obs)
-        return np.stack(self.frames, axis=0), reward, terminated, truncated, info
+        return np.concatenate(self.frames, axis=0), r, done, info
 
-# ResizeObservation (unchanged)
-class ResizeObservation(Wrapper):
-    def __init__(self, env, shape):
-        super().__init__(env)
-        self.shape = shape
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        obs = self._resize_grayscale(obs)
-        return obs, info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        obs = self._resize_grayscale(obs)
-        return obs, reward, terminated, truncated, info
-
-    def _resize_grayscale(self, obs):
-        obs = cv2.resize(obs, self.shape[::-1], interpolation=cv2.INTER_AREA)
-        if len(obs.shape) == 3 and obs.shape[-1] == 3:
-            obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-            obs = np.expand_dims(obs, axis=-1)
-        return obs
-
-# CategoricalDQN (unchanged)
-class CategoricalDQN(nn.Module):
-    def __init__(self, input_shape, num_actions=12, num_atoms=51, V_min=-10, V_max=10, std_init=0.5, use_dueling=False):
-        super(CategoricalDQN, self).__init__()
-        self.num_actions = num_actions
-        self.num_atoms = num_atoms
-        self.V_min = V_min
-        self.V_max = V_max
-        self.use_dueling = use_dueling
-        self.num_stack = input_shape[0]
-        self.channels = input_shape[-1]
-        self.conv = nn.Sequential(
-            nn.Conv2d(self.num_stack * self.channels, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU()
+# ICM
+class ICM(nn.Module):
+    def __init__(self, feat_dim, n_actions, embed_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Flatten(), nn.Linear(feat_dim, embed_dim), nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim), nn.ReLU()
         )
-        conv_out_size = self._get_conv_out(input_shape)
-        
-        if self.use_dueling:
-            self.fc_value = nn.Sequential(
-                NoisyLinear(conv_out_size, 512, std_init=std_init),
-                nn.ReLU(),
-                NoisyLinear(512, num_atoms, std_init=std_init)
-            )
-            self.fc_advantage = nn.Sequential(
-                NoisyLinear(conv_out_size, 512, std_init=std_init),
-                nn.ReLU(),
-                NoisyLinear(512, num_actions * num_atoms, std_init=std_init)
-            )
-        else:
-            self.fc = nn.Sequential(
-                NoisyLinear(conv_out_size, 512, std_init=std_init),
-                nn.ReLU(),
-                NoisyLinear(512, num_actions * num_atoms, std_init=std_init)
-            )
+        self.inverse_model = nn.Sequential(
+            nn.Linear(embed_dim*2, 512), nn.ReLU(),
+            nn.Linear(512, n_actions)
+        )
+        self.forward_model = nn.Sequential(
+            nn.Linear(embed_dim + n_actions, 512), nn.ReLU(),
+            nn.Linear(512, embed_dim)
+        )
+    def forward(self, feat, next_feat, action):
+        phi = self.encoder(feat)
+        phi_next = self.encoder(next_feat)
+        inv_in = torch.cat([phi, phi_next], dim=1)
+        logits = self.inverse_model(inv_in)
+        a_onehot = F.one_hot(action, logits.size(-1)).float()
+        fwd_in = torch.cat([phi, a_onehot], dim=1)
+        pred_phi_next = self.forward_model(fwd_in)
+        return logits, pred_phi_next, phi_next
 
-    def _get_conv_out(self, shape):
-        num_stack, height, width, channels = shape
-        dummy_input = torch.zeros(1, num_stack, height, width, channels)
-        dummy_input = dummy_input.view(1, num_stack * channels, height, width)
-        o = self.conv(dummy_input)
-        return int(np.prod(o.size()))
-
-    def forward(self, x):
-        batch_size = x.size(0)
-        x = x.view(batch_size, self.num_stack * self.channels, x.size(2), x.size(3))
-        conv_out = self.conv(x).view(batch_size, -1)
-        if self.use_dueling:
-            value = self.fc_value(conv_out).view(batch_size, 1, self.num_atoms)
-            advantage = self.fc_advantage(conv_out).view(batch_size, self.num_actions, self.num_atoms)
-            probs = value + (advantage - advantage.mean(dim=1, keepdim=True))
-        else:
-            probs = self.fc(conv_out).view(batch_size, self.num_actions, self.num_atoms)
-        return torch.softmax(probs, dim=-1)
-
+# Noisy Linear Layer
+class NoisyLinear(nn.Module):
+    def __init__(self, in_f, out_f, sigma_init):
+        super().__init__()
+        self.in_f, self.out_f = in_f, out_f
+        self.weight_mu = nn.Parameter(torch.empty(out_f, in_f))
+        self.weight_sigma = nn.Parameter(torch.empty(out_f, in_f))
+        self.register_buffer('weight_epsilon', torch.empty(out_f, in_f))
+        self.bias_mu = nn.Parameter(torch.empty(out_f))
+        self.bias_sigma = nn.Parameter(torch.empty(out_f))
+        self.register_buffer('bias_epsilon', torch.empty(out_f))
+        self.sigma_init = sigma_init
+        self.reset_parameters()
+        self.reset_noise()
+    def reset_parameters(self):
+        bound = 1 / (self.in_f**0.5)
+        nn.init.uniform_(self.weight_mu, -bound, bound)
+        nn.init.constant_(self.weight_sigma, self.sigma_init / (self.in_f**0.5))
+        nn.init.uniform_(self.bias_mu, -bound, bound)
+        nn.init.constant_(self.bias_sigma, self.sigma_init / (self.out_f**0.5))
     def reset_noise(self):
-        for module in self.modules():
-            if isinstance(module, NoisyLinear):
-                module.reset_noise()
+        f = lambda x: x.sign() * x.abs().sqrt()
+        eps_in = f(torch.randn(self.in_f))
+        eps_out = f(torch.randn(self.out_f))
+        self.weight_epsilon.copy_(eps_out.ger(eps_in))
+        self.bias_epsilon.copy_(eps_out)
+    def forward(self, x):
+        if self.training:
+            w = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            b = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            w, b = self.weight_mu, self.bias_mu
+        return F.linear(x, w, b)
 
-    def zero_noise(self):
-        for module in self.modules():
-            if isinstance(module, NoisyLinear):
-                module.w_epsilon.zero_()
-                module.b_epsilon.zero_()
+# Dueling CNN
+class DuelingCNN(nn.Module):
+    def __init__(self, in_c, n_actions, noisy_sigma_init):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(in_c, 32, 8, 4), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, 2), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, 1), nn.ReLU(),
+            nn.Flatten()
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_c, 84, 90)
+            feat_dim = self.features(dummy).shape[1]
+        self.val_noisy = NoisyLinear(feat_dim, 512, sigma_init=noisy_sigma_init)
+        self.val = NoisyLinear(512, 1, sigma_init=noisy_sigma_init)
+        self.adv_noisy = NoisyLinear(feat_dim, 512, sigma_init=noisy_sigma_init)
+        self.adv = NoisyLinear(512, n_actions, sigma_init=noisy_sigma_init)
+    def forward(self, x):
+        x = self.features(x / 255.0)
+        v = F.relu(self.val_noisy(x))
+        v = self.val(v)
+        a = F.relu(self.adv_noisy(x))
+        a = self.adv(a)
+        return v + (a - a.mean(dim=1, keepdim=True))
+    def reset_noise(self):
+        for m in [self.val_noisy, self.val, self.adv_noisy, self.adv]:
+            m.reset_noise()
 
-# Transition and stack_data (unchanged)
-Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done', 'gamma'))
+# Replay Buffer
+class PrioritizedReplayBuffer:
+    def __init__(self, cap, alpha, beta_start, beta_frames, n_step, gamma):
+        self.cap, self.alpha = cap, alpha
+        self.beta_start, self.beta_frames = beta_start, beta_frames
+        self.beta_by_frame = lambda f: min(1.0, beta_start + f * (1.0 - beta_start) / beta_frames)
+        self.n_step, self.gamma = n_step, gamma
+        self.buffer = []
+        self.prios = np.zeros((cap,), dtype=np.float32)
+        self.pos = 0
+        self.n_buf = deque(maxlen=n_step)
+        self.Exp = namedtuple('Exp', ['s', 'a', 'r', 's2', 'd'])
+    def _get_n_step(self):
+        r, s2, d = self.n_buf[-1].r, self.n_buf[-1].s2, self.n_buf[-1].d
+        for trans in reversed(list(self.n_buf)[:-1]):
+            r = trans.r + self.gamma * r * (1 - trans.d)
+            s2, d = (trans.s2, trans.d) if trans.d else (s2, d)
+        return r, s2, d
+    def add(self, s, a, r, s2, d):
+        self.n_buf.append(self.Exp(s, a, r, s2, d))
+        if len(self.n_buf) < self.n_step: return
+        r_n, s2_n, d_n = self._get_n_step()
+        s0, a0 = self.n_buf[0].s, self.n_buf[0].a
+        exp = self.Exp(s0, a0, r_n, s2_n, d_n)
+        if len(self.buffer) < self.cap:
+            self.buffer.append(exp)
+            prio = 1.0 if len(self.buffer) == 1 else self.prios.max()
+        else:
+            self.buffer[self.pos] = exp
+            prio = self.prios.max()
+        self.prios[self.pos] = prio
+        self.pos = (self.pos + 1) % self.cap
+    def sample(self, bs, frame_idx):
+        N = len(self.buffer)
+        if N == 0: return [], [], [], [], [], [], []
+        prios = self.prios[:N] ** self.alpha
+        sum_p = prios.sum()
+        probs = prios / sum_p if sum_p > 0 else np.ones_like(prios) / N
+        idxs = np.random.choice(N, bs, p=probs)
+        batch = self.Exp(*zip(*[self.buffer[i] for i in idxs]))
+        beta = self.beta_by_frame(frame_idx)
+        weights = (N * probs[idxs]) ** (-beta)
+        weights /= weights.max()
+        return (np.array(batch.s), batch.a, batch.r, np.array(batch.s2), batch.d, weights.astype(np.float32), idxs)
+    def update_priorities(self, idxs, errors):
+        for i, e in zip(idxs, errors):
+            self.prios[i] = abs(e) + 1e-6
 
-def stack_data(batch_data, device='cpu', dtype=torch.float32):
-    assert isinstance(batch_data, (list, tuple))
-    if isinstance(batch_data[0], torch.Tensor):
-        return torch.stack(batch_data).to(device).to(dtype)
-    elif isinstance(batch_data[0], np.ndarray):
-        return torch.from_numpy(np.array(batch_data)).to(device).to(dtype)
-    else:
-        return torch.tensor(batch_data, dtype=dtype, device=device)
+# Agent
+class Agent:
+    def __init__(self, obs_shape, n_actions, device, args):
+        self.device = device
+        self.n_actions = n_actions
+        self.online = DuelingCNN(obs_shape[0], n_actions, args.noisy_sigma_init).to(device)
+        self.target = DuelingCNN(obs_shape[0], n_actions, args.noisy_sigma_init).to(device)
+        self.target.load_state_dict(self.online.state_dict())
+        self.target.eval()
+        self.opt = optim.Adam(self.online.parameters(), lr=args.lr, eps=args.adam_eps)
+        with torch.no_grad():
+            dummy = torch.zeros(1, *obs_shape).to(device)
+            feat_dim = self.online.features(dummy).shape[1]
+        self.icm = ICM(feat_dim, n_actions, embed_dim=args.icm_embed_dim).to(device)
+        self.icm_opt = optim.Adam(self.icm.parameters(), lr=args.icm_lr)
+        self.buffer = PrioritizedReplayBuffer(
+            args.buffer_capacity, args.per_alpha, args.per_beta, args.per_beta_frames, args.n_step, args.gamma
+        )
+        self.args = args
+        self.frame_idx = 0
+    def act(self, state):
+        s_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            q = self.online(s_t)
+        return int(q.argmax(1).item())
+    def push(self, s, a, r, s2, d):
+        self.buffer.add(s, a, r, s2, d)
+    def learn(self):
+        if self.frame_idx < self.args.batch_size: return
+        s, a, r_ext, s2, d, w, idxs = self.buffer.sample(self.args.batch_size, self.frame_idx)
+        s = torch.tensor(s, dtype=torch.float32, device=self.device)
+        s2 = torch.tensor(s2, dtype=torch.float32, device=self.device)
+        a = torch.tensor(a, dtype=torch.int64, device=self.device)
+        d = torch.tensor(d, dtype=torch.float32, device=self.device)
+        w = torch.tensor(w, dtype=torch.float32, device=self.device)
+        r_ext = torch.tensor(r_ext, dtype=torch.float32, device=self.device)
+        feat = self.online.features(s / 255.0)
+        nxt_feat = self.online.features(s2 / 255.0)
+        feat_icm = feat.detach()
+        nxt_feat_icm = nxt_feat.detach()
+        logits, pred_phi_n, true_phi_n = self.icm(feat_icm, nxt_feat_icm, a)
+        inv_loss = F.cross_entropy(logits, a)
+        fwd_loss = F.mse_loss(pred_phi_n, true_phi_n.detach())
+        icm_loss = (1 - self.args.icm_beta) * inv_loss + self.args.icm_beta * fwd_loss
+        with torch.no_grad():
+            int_r = self.args.icm_eta * 0.5 * (pred_phi_n - true_phi_n).pow(2).sum(dim=1)
+        q_pred = self.online(s).gather(1, a.unsqueeze(1)).squeeze(1)
+        a_n = self.online(s2).argmax(1)
+        q_next = self.target(s2).gather(1, a_n.unsqueeze(1)).squeeze(1)
+        total_r = r_ext + int_r
+        q_tar = total_r + (self.args.gamma ** self.args.n_step) * q_next * (1 - d)
+        td = q_pred - q_tar.detach()
+        dqn_loss = (F.smooth_l1_loss(q_pred, q_tar.detach(), reduction='none') * w).mean()
+        self.opt.zero_grad()
+        dqn_loss.backward()
+        self.opt.step()
+        self.online.reset_noise()
+        self.target.reset_noise()
+        self.buffer.update_priorities(idxs, td.detach().cpu().numpy())
+        self.icm_opt.zero_grad()
+        icm_loss.backward()
+        self.icm_opt.step()
+        if self.frame_idx % self.args.copy_network_freq == 0:
+            self.target.load_state_dict(self.online.state_dict())
 
-# get_beta (unchanged)
-def get_beta(step, total_steps, beta_start=0.4, beta_end=1.0):
-    fraction = min(1.0, step / total_steps)
-    return beta_start + fraction * (beta_end - beta_start)
-
-# Function to get memory usage (unchanged)
+# Utility Function for Memory Usage
 def get_memory_usage(device):
     process = psutil.Process(os.getpid())
-    cpu_mem = process.memory_info().rss / 1024 / 1024
+    cpu_mem = process.memory_info().rss / 1024 / 1024  # Convert to MB
     gpu_mem = "N/A"
     if device.type == "cuda":
-        gpu_mem = torch.cuda.memory_allocated(device) / 1024 / 1024
+        gpu_mem = torch.cuda.memory_allocated(device) / 1024 / 1024  # Convert to MB
     return cpu_mem, gpu_mem
 
-# train_rainbow_dqn (optimized memory management frequency)
-def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=0, start_episode=0, warmup_done=False):
-    num_actions = env.action_space.n
-    num_atoms = args.num_atoms
-    V_min = args.V_min
-    V_max = args.V_max
-    batch_size = args.batch_size
-    gamma = args.gamma
-    n_step = args.n_step
-    target_update = args.target_update
-    warmup_steps = args.warmup_steps
-    use_double_dqn = args.use_double_dqn
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    delta_z = (V_max - V_min) / (num_atoms - 1)
-    z = torch.linspace(V_min, V_max, num_atoms).to(device)
-    history_rewards = []
-    steps_done = start_steps
-    epsilon_start = 1.0
-    epsilon_end = 0.1
-    epsilon_decay = args.total_steps // 2
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+# Training Loop
+def train(args, checkpoint_path='checkpoints/rainbow_icm.pth'):
+    env = gym_super_mario_bros.make('SuperMarioBros-v0')
+    env = JoypadSpace(env, COMPLEX_MOVEMENT)
+    env = SkipFrame(env, args.skip_frames)
+    env = GrayScaleResize(env)
+    env = FrameStack(env, 4)
+    env = TimeLimit(env, max_episode_steps=args.max_episode_steps)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    agent = Agent(env.observation_space.shape, env.action_space.n, device, args)
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    start_ep, fi = 1, 0
+    if os.path.isfile(checkpoint_path):
+        ck = torch.load(checkpoint_path, map_location=device)
+        agent.online.load_state_dict(ck['model'])
+        agent.target.load_state_dict(ck['model'])
+        agent.opt.load_state_dict(ck['optimizer'])
+        agent.icm_opt.load_state_dict(ck['icm_opt'])
+        fi = ck.get('frame_idx', 0)
+        start_ep = ck.get('episode', 0) + 1
+    agent.frame_idx = fi
+    raw = env.reset()
+    state = raw
     last_cpu_mem, last_gpu_mem = None, None
-
-    def get_epsilon(step):
-        fraction = min(1.0, step / epsilon_decay)
-        return epsilon_start + fraction * (epsilon_end - epsilon_start)
-
-    if not warmup_done:
-        print("Starting warmup phase...")
-        state, info = env.reset()
-        state_tensor = torch.tensor(state, dtype=torch.float32, device=device) / 255.0
-        with tqdm(total=warmup_steps, desc="Warmup Steps") as pbar:
-            while steps_done < warmup_steps:
-                action = env.action_space.sample()
-                next_state, reward, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
-                next_state_tensor = torch.tensor(next_state, dtype=torch.float32, device=device) / 255.0
-                reward = float(reward)
-                gamma_val = 0.0 if done else gamma
-                memory.add(data=(state, action, reward, next_state, done), priority=None)
-                state = next_state
-                state_tensor = next_state_tensor
-                steps_done += 1
-
-                # Update memory stats less frequently
-                if steps_done % 10 == 0:
-                    last_cpu_mem, last_gpu_mem = get_memory_usage(device)
-                postfix = {"CPU Mem (MB)": f"{last_cpu_mem:.2f}" if last_cpu_mem is not None else "N/A"}
-                if last_gpu_mem != "N/A":
-                    postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}" if last_gpu_mem is not None else "N/A"
-                pbar.set_postfix(postfix)
-                pbar.update(1)
-
-                if done:
-                    state, info = env.reset()
-                    state_tensor = torch.tensor(state, dtype=torch.float32, device=device) / 255.0
-
-                # Free memory less frequently
-                if steps_done % 100 == 0:
-                    del next_state_tensor
-                    gc.collect()
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
-
-        print("Warmup phase completed.")
-    else:
-        print("Warmup phase skipped (loaded from checkpoint).")
-
-    with tqdm(range(start_episode, args.num_episodes), desc="Training Episodes", unit="episode") as pbar:
-        for episode in pbar:
-            policy_net.reset_noise()
-            state, info = env.reset()
-            state_tensor = torch.tensor(state, dtype=torch.float32, device=device) / 255.0
-            episode_reward = 0
+    while len(agent.buffer.buffer) < args.batch_size:
+        a = agent.act(state)
+        nxt, r, d, _ = env.step(a)
+        agent.push(state, a, r, nxt, d)
+        state = nxt
+        if d: state = env.reset()
+    hist = {'reward': [], 'env_reward': [], 'stage': [], 'Trun': []}
+    with tqdm(range(start_ep, args.num_episodes + 1), desc="Training Episodes", unit="episode") as pbar:
+        for ep in pbar:
+            obs = env.reset()
+            state = obs
+            ep_r, ep_er, prev_x, prev_life = 0, 0, None, None
             done = False
             steps_in_episode = 0
-
             while not done:
-                epsilon = get_epsilon(steps_done)
-                if random.random() < epsilon:
-                    action = env.action_space.sample()
-                else:
-                    with torch.no_grad():
-                        state_batched = state_tensor.unsqueeze(0)
-                        with torch.amp.autocast('cuda') if device.type == "cuda" else torch.no_grad():
-                            probs = policy_net(state_batched)
-                            q_values = (probs * z).sum(dim=-1)
-                        action = q_values.argmax(dim=1).item()
-                        del probs, q_values
-                next_state, reward, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
-                next_state_tensor = torch.tensor(next_state, dtype=torch.float32, device=device) / 255.0
-                reward = float(reward)
-                gamma_val = 0.0 if done else gamma
-                episode_reward += reward
-                memory.add(data=(state, action, reward, next_state, done), priority=None)
-                state = next_state
-                state_tensor = next_state_tensor
-                steps_done += 1
+                agent.frame_idx += 1
                 steps_in_episode += 1
-
-                if len(memory) >= batch_size and steps_done % 4 == 0:
-                    batch_idx, batch_seq_data, sampling_weight = memory.sample(batch_size, n_step)
-                    bias_max_weight = (len(memory) * memory.min_priority) ** (-get_beta(steps_done, args.total_steps))
-                    bias_weight = (len(memory) * np.array(sampling_weight)) ** (-get_beta(steps_done, args.total_steps))
-                    weights = torch.tensor(bias_weight / bias_max_weight, dtype=torch.float32, device=device)
-
-                    batch_data = []
-                    for seq_data in batch_seq_data:
-                        data = list(seq_data.pop(0))
-                        data.append(len(seq_data) + 1)
-                        if len(seq_data) > 0:
-                            data[3] = seq_data[-1][3]
-                        for i, _data in enumerate(seq_data):
-                            data[2] += (gamma ** (i + 1)) * _data[2]
-                        batch_data.append(data)
-
-                    states = stack_data([data[0] for data in batch_data], device, torch.float32) / 255.0
-                    actions = stack_data([data[1] for data in batch_data], device, torch.int64)
-                    rewards = stack_data([data[2] for data in batch_data], device)
-                    next_states = stack_data([data[3] for data in batch_data], device, torch.float32) / 255.0
-                    dones = stack_data([data[4] for data in batch_data], device).to(rewards.dtype)
-                    n_steps = [data[5] for data in batch_data]
-
-                    with torch.no_grad():
-                        with torch.amp.autocast('cuda') if device.type == "cuda" else torch.no_grad():
-                            gammas = stack_data([gamma ** n for n in n_steps], device)
-                            if use_double_dqn:
-                                next_probs = target_net(next_states)
-                            else:
-                                next_probs = policy_net(next_states)
-                            next_q = (next_probs * z).sum(dim=-1)
-                            next_action = next_q.argmax(dim=1)
-                            target_probs = (next_probs)[range(batch_size), next_action]
-                            target_z = rewards.unsqueeze(1) + (1 - dones.unsqueeze(1)) * gammas.unsqueeze(1) * z.unsqueeze(0)
-                            target_z = target_z.clamp(V_min, V_max)
-                            b = (target_z - V_min) / delta_z
-                            l = b.floor().long()
-                            u = b.ceil().long()
-                            m = torch.zeros(batch_size, num_atoms, device=device)
-
-                            offset = torch.linspace(0, (batch_size - 1) * num_atoms, batch_size).long().unsqueeze(1).expand(batch_size, num_atoms).to(device)
-                            l_clamped = l.clamp(0, num_atoms - 1)
-                            u_clamped = u.clamp(0, num_atoms - 1)
-                            m_flat = m.view(-1)
-                            l_indices = (l_clamped + offset).view(-1).long()
-                            u_indices = (u_clamped + offset).view(-1).long()
-                            l_source = (target_probs * (u.float() - b)).view(-1).float()
-                            u_source = (target_probs * (b - l.float())).view(-1).float()
-                            m_flat.index_add_(0, l_indices, l_source)
-                            m_flat.index_add_(0, u_indices, u_source)
-                            del next_probs, next_q, next_action, target_probs, target_z, b, l, u, offset, l_clamped, u_clamped, m_flat, l_indices, u_indices, l_source, u_source
-
-                    with torch.amp.autocast('cuda') if device.type == "cuda" else torch.no_grad():
-                        probs = policy_net(states)[range(batch_size), actions]
-                        loss = -(m * torch.log(probs + 1e-10)).sum(dim=-1)
-                        weighted_loss = weights * loss
-                        priorities = loss.detach().cpu().numpy() + 1e-5
-                        loss = weighted_loss.mean()
-                        del probs, m, weighted_loss
-
-                    optimizer.zero_grad()
-                    if device.type == "cuda":
-                        scaler.scale(loss).backward()
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(policy_net.parameters(), args.grad_clip_norm)
-                        optimizer.step()
-
-                    for idx, priority in zip(batch_idx, priorities):
-                        memory.update_priority(idx, (priority ** args.alpha).item())
-
-                    del states, actions, rewards, next_states, dones, gammas, weights, loss, priorities
-
-                if use_double_dqn and steps_done % target_update == 0:
-                    target_net.load_state_dict(policy_net.state_dict())
-
-                # Free memory and update memory stats less frequently
-                if steps_in_episode % 50 == 0:
-                    gc.collect()
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
+                a = agent.act(state)
+                nxt, r_env, done, info = env.step(a)
+                truncated = info.get('TimeLimit.truncated', False)
+                done_flag = done and not truncated
+                cr = r_env
+                x_pos, life = info.get('x_pos'), info.get('life')
+                if x_pos is not None:
+                    if prev_x is None: prev_x = x_pos
+                    dx = x_pos - prev_x
+                    cr += args.backward_penalty if dx < 0 else args.stay_penalty if dx == 0 else 0
+                    prev_x = x_pos
+                if prev_life is None: prev_life = life
+                elif life < prev_life:
+                    cr += args.death_penalty
+                    prev_life = life
+                agent.push(state, a, cr, nxt, done_flag)
+                agent.learn()
+                state = nxt
+                ep_r += cr
+                ep_er += r_env
                 if steps_in_episode % 10 == 0:
                     last_cpu_mem, last_gpu_mem = get_memory_usage(device)
-                postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{last_cpu_mem:.2f}" if last_cpu_mem is not None else "N/A"}
+                postfix = {
+                    "Steps": steps_in_episode,
+                    "CustR": f"{ep_r:.2f}",
+                    "EnvR": f"{ep_er:.2f}",
+                    "CPU Mem (MB)": f"{last_cpu_mem:.2f}" if last_cpu_mem is not None else "N/A"
+                }
                 if last_gpu_mem != "N/A":
                     postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}" if last_gpu_mem is not None else "N/A"
-                pbar.set_postfix(postfix)
-
-            # Ensure final cleanup per episode
-            gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+                pbar.set_postfix(**postfix)
+            hist['reward'].append(ep_r)
+            hist['env_reward'].append(ep_er)
+            hist['stage'].append(env.unwrapped._stage)
+            hist['Trun'].append("TERMINATED" if done else "TRUNCATED")
             last_cpu_mem, last_gpu_mem = get_memory_usage(device)
-            postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{last_cpu_mem:.2f}"}
-            if last_gpu_mem != "N/A":
-                postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}"
-            pbar.set_postfix(postfix)
-
-            history_rewards.append(episode_reward)
-            if (episode + 1) % args.checkpoint_interval == 0:
-                avg_reward = np.mean(history_rewards[-args.checkpoint_interval:]) if len(history_rewards) >= args.checkpoint_interval else np.mean(history_rewards)
-                print(f"Episode {episode + 1}/{args.num_episodes}, Avg Reward (last {args.checkpoint_interval}): {avg_reward:.2f}")
-                try:
-                    os.makedirs("checkpoints", exist_ok=True)
-                    checkpoint = {
-                        'state_dict': policy_net.state_dict(),
-                        'steps_done': steps_done,
-                        'episode': episode,
-                        'warmup_done': steps_done >= warmup_steps
-                    }
-                    torch.save(checkpoint, f"checkpoints/checkpoint_episode_{episode + 1}.pth")
-                except Exception as e:
-                    print(f"Error saving checkpoint: {e}")
-                evaluate_agent(env, policy_net, args, episode, steps_done)
-
-    return policy_net, steps_done
-
-# evaluate_agent (optimized memory management frequency)
-def evaluate_agent(env, policy_net, args, episode, steps_done):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_atoms = args.num_atoms
-    V_min = args.V_min
-    V_max = args.V_max
-    z = torch.linspace(V_min, V_max, num_atoms).to(device)
-
-    policy_net.eval()
-    total_reward = 0
-    num_episodes = 10
-    last_cpu_mem, last_gpu_mem = None, None
-
-    pbar = tqdm(range(num_episodes), desc="Evaluation Episodes")
-    for ep in pbar:
-        policy_net.zero_noise()
-        state, info = env.reset()
-        state_tensor = torch.tensor(state, dtype=torch.float32, device=device) / 255.0
-        episode_reward = 0
-        done = False
-        steps_in_episode = 0
-        while not done:
-            with torch.no_grad():
-                state_batched = state_tensor.unsqueeze(0)
-                with torch.amp.autocast('cuda') if device.type == "cuda" else torch.no_grad():
-                    probs = policy_net(state_batched)
-                    q_values = (probs * z).sum(dim=-1)
-                action = q_values.argmax(dim=1).item()
-                del probs, q_values
-            next_state, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            next_state_tensor = torch.tensor(next_state, dtype=torch.float32, device=device) / 255.0
-            state_tensor = next_state_tensor
-            episode_reward += reward
-            steps_in_episode += 1
-
-            # Free memory and update memory stats less frequently
-            if steps_in_episode % 50 == 0:
-                del next_state_tensor
-                gc.collect()
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-            if steps_in_episode % 10 == 0:
-                last_cpu_mem, last_gpu_mem = get_memory_usage(device)
-            postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{last_cpu_mem:.2f}" if last_cpu_mem is not None else "N/A"}
+            postfix = {
+                "Steps": steps_in_episode,
+                "CustR": f"{ep_r:.2f}",
+                "EnvR": f"{ep_er:.2f}",
+                "CPU Mem (MB)": f"{last_cpu_mem:.2f}" if last_cpu_mem is not None else "N/A"
+            }
             if last_gpu_mem != "N/A":
                 postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}" if last_gpu_mem is not None else "N/A"
-            pbar.set_postfix(postfix)
+            pbar.set_postfix(**postfix)
+            if ep % 100 == 0:
+                eval_env = gym_super_mario_bros.make('SuperMarioBros-v0')
+                eval_env = JoypadSpace(eval_env, COMPLEX_MOVEMENT)
+                eval_env = SkipFrame(eval_env, args.skip_frames)
+                eval_env = GrayScaleResize(eval_env)
+                eval_env = FrameStack(eval_env, 4)
+                eval_env = TimeLimit(eval_env, max_episode_steps=args.max_episode_steps)
+                eval_rewards = []
+                with tqdm(range(10), desc=f"Evaluation at Episode {ep}", unit="eval ep") as eval_bar:
+                    for _ in eval_bar:
+                        e_obs = eval_env.reset()
+                        done = False
+                        total = 0.0
+                        step = 0
+                        while not done and step < 2000:
+                            a = agent.act(e_obs)
+                            e_obs, r, done, _ = eval_env.step(a)
+                            total += r
+                            step += 1
+                            if step % 10 == 0:
+                                last_cpu_mem, last_gpu_mem = get_memory_usage(device)
+                            postfix = {
+                                "Steps": step,
+                                "Reward": f"{total:.2f}",
+                                "CPU Mem (MB)": f"{last_cpu_mem:.2f}" if last_cpu_mem is not None else "N/A"
+                            }
+                            if last_gpu_mem != "N/A":
+                                postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}" if last_gpu_mem is not None else "N/A"
+                            eval_bar.set_postfix(**postfix)
+                        eval_rewards.append(total)
+                eval_env.close()
+                print(f"Evaluation at Episode {ep}: Avg Reward over 10 eps: {np.mean(eval_rewards):.2f}")
+                torch.save({
+                    'model': agent.online.state_dict(),
+                    'optimizer': agent.opt.state_dict(),
+                    'icm_opt': agent.icm_opt.state_dict(),
+                    'frame_idx': agent.frame_idx,
+                    'episode': ep
+                }, checkpoint_path)
+    print("Training complete.")
+    return hist
 
-        # Ensure final cleanup per episode
-        del next_state_tensor
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        last_cpu_mem, last_gpu_mem = get_memory_usage(device)
-        postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{last_cpu_mem:.2f}"}
-        if last_gpu_mem != "N/A":
-            postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}"
-        pbar.set_postfix(postfix)
-        total_reward += episode_reward
-
-    avg_reward = total_reward / num_episodes
-    print(f"Evaluation after episode {episode + 1}: Average reward = {avg_reward}")
-
-    try:
-        os.makedirs("checkpoints", exist_ok=True)
-        ckpt_path = f"checkpoints/eval_ckpt_{steps_done}.pth"
-        torch.save({
-            'state_dict': policy_net.state_dict(),
-            'steps_done': steps_done,
-            'episode': episode,
-        }, ckpt_path)
-        print(f"Saved evaluation checkpoint at {ckpt_path}")
-    except Exception as e:
-        print(f"Error saving evaluation checkpoint: {e}")
-
-    policy_net.train()
-    return avg_reward
-
-# load_checkpoint (unchanged)
-def load_checkpoint(model, checkpoint_path, device):
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['state_dict'])
-        steps_done = checkpoint.get('steps_done', 0)
-        episode = checkpoint.get('episode', 0)
-        warmup_done = checkpoint.get('warmup_done', False)
-        print(f"Loaded checkpoint from {checkpoint_path}")
-        print(f"Resuming from Episode {episode + 1}, Steps Done: {steps_done}, Warmup Done: {warmup_done}")
-        return steps_done, episode, warmup_done
-    except FileNotFoundError:
-        print(f"Checkpoint file {checkpoint_path} not found.")
-        raise
-    except Exception as e:
-        print(f"Error loading checkpoint: {e}")
-        raise
-
-# main (unchanged)
 def main():
-    parser = argparse.ArgumentParser(description="Rainbow DQN for Super Mario Bros")
-    parser.add_argument("--num_episodes", type=int, default=1000, help="Number of training episodes")
-    parser.add_argument("--warmup_steps", type=int, default=10000, help="Number of warmup steps")
+    parser = argparse.ArgumentParser(description="DQN with ICM for Super Mario Bros")
+    parser.add_argument("--num_episodes", type=int, default=100000, help="Number of training episodes")
+    parser.add_argument("--copy_network_freq", type=int, default=10000, help="Frequency to copy online to target network")
+    parser.add_argument("--buffer_capacity", type=int, default=10000, help="Replay buffer capacity")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
     parser.add_argument("--gamma", type=float, default=0.9, help="Discount factor")
-    parser.add_argument("--n_step", type=int, default=3, help="N-step return")
-    parser.add_argument("--target_update", type=int, default=10000, help="Steps between target network updates")
-    parser.add_argument("--num_atoms", type=int, default=51, help="Number of atoms in categorical DQN")
-    parser.add_argument("--V_min", type=float, default=-10, help="Minimum value for categorical DQN")
-    parser.add_argument("--V_max", type=float, default=10, help="Maximum value for categorical DQN")
-    parser.add_argument("--lr", type=float, default=2.5e-4, help="Learning rate for Adam optimizer")
-    parser.add_argument("--eps", type=float, default=1.5e-4, help="Epsilon for Adam optimizer")
-    parser.add_argument("--memory_capacity", type=int, default=10000, help="Replay buffer capacity")
-    parser.add_argument("--alpha", type=float, default=0.6, help="Prioritized replay alpha")
-    parser.add_argument("--beta", type=float, default=0.4, help="Initial prioritized replay beta")
-    parser.add_argument("--num_eval_episodes", type=int, default=5, help="Number of evaluation episodes")
-    parser.add_argument("--resize_shape", type=int, default=84, help="Size for resizing observations")
-    parser.add_argument("--total_steps", type=int, default=10000000, help="Total steps for beta annealing")
-    parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to checkpoint file to load (optional)")
-    parser.add_argument("--checkpoint_interval", type=int, default=100, help="Interval (in episodes) to save checkpoints and evaluate")
-    parser.add_argument("--std_init", type=float, default=0.5, help="Initial standard deviation for NoisyLinear layers")
-    parser.add_argument("--num_stack", type=int, default=4, help="Number of frames to stack in CustomFrameStack")
-    parser.add_argument("--repeat", type=int, default=4, help="Number of action repeats in ActionRepeatWrapper")
-    parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Gradient clipping norm")
-    parser.add_argument("--use_double_dqn", action="store_true", default=False, help="Use Double DQN (default: False to save memory)")
-    parser.add_argument("--use_dueling", action="store_true", default=False, help="Use Dueling Networks (default: False to save memory)")
+    parser.add_argument("--eps_start", type=float, default=1.0, help="Starting epsilon for exploration")
+    parser.add_argument("--eps_end", type=float, default=0.01, help="Ending epsilon for exploration")
+    parser.add_argument("--eps_decay", type=float, default=0.9999, help="Epsilon decay rate")
+    parser.add_argument("--lr", type=float, default=0.00025, help="Learning rate for DQN optimizer")
+    parser.add_argument("--adam_eps", type=float, default=0.00015, help="Epsilon for Adam optimizer")
+    parser.add_argument("--per_alpha", type=float, default=0.6, help="Prioritized replay alpha")
+    parser.add_argument("--per_beta", type=float, default=0.4, help="Initial prioritized replay beta")
+    parser.add_argument("--per_beta_frames", type=int, default=2000000, help="Frames for beta annealing")
+    parser.add_argument("--per_epsilon", type=float, default=0.1, help="Epsilon for prioritized replay")
+    parser.add_argument("--n_step", type=int, default=5, help="N-step return")
+    parser.add_argument("--noisy_sigma_init", type=float, default=2.5, help="Initial sigma for noisy layers")
+    parser.add_argument("--backward_penalty", type=float, default=0, help="Penalty for moving backward")
+    parser.add_argument("--stay_penalty", type=float, default=0, help="Penalty for staying still")
+    parser.add_argument("--death_penalty", type=float, default=-100, help="Penalty for dying")
+    parser.add_argument("--skip_frames", type=int, default=4, help="Number of frames to skip")
+    parser.add_argument("--max_episode_steps", type=int, default=3000, help="Max steps per episode")
+    parser.add_argument("--max_frames", type=int, default=44800000, help="Total training frames")
+    parser.add_argument("--icm_embed_dim", type=int, default=256, help="Embedding dimension for ICM")
+    parser.add_argument("--icm_beta", type=float, default=0.2, help="ICM inverse vs forward loss trade-off")
+    parser.add_argument("--icm_eta", type=float, default=0.01, help="ICM intrinsic reward scale")
+    parser.add_argument("--icm_lr", type=float, default=1e-4, help="Learning rate for ICM optimizer")
     args = parser.parse_args()
+    train(args)
 
-    if args.resize_shape <= 0:
-        raise ValueError("resize_shape must be a positive integer")
-    if args.checkpoint_interval <= 0:
-        raise ValueError("checkpoint_interval must be a positive integer")
-    if args.memory_capacity <= 0:
-        raise ValueError("memory_capacity must be a positive integer")
-    if args.batch_size <= 0:
-        raise ValueError("batch_size must be a positive integer")
-    if args.std_init <= 0:
-        raise ValueError("std_init must be a positive float")
-    if args.num_stack <= 0:
-        raise ValueError("num_stack must be a positive integer")
-    if args.repeat <= 0:
-        raise ValueError("repeat must be a positive integer")
-    if args.grad_clip_norm <= 0:
-        raise ValueError("grad_clip_norm must be a positive float")
-
-    env = gym_super_mario_bros.make('SuperMarioBros-1-1-v0')
-    env = JoypadSpace(env, COMPLEX_MOVEMENT)
-    env = ResetCompatibilityWrapper(env)
-    env = ResizeObservation(env, shape=(args.resize_shape, args.resize_shape))
-    env = CustomFrameStack(env, num_stack=args.num_stack)
-    env = ActionRepeatWrapper(env, repeat=args.repeat)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    result = env.reset()
-    if isinstance(result, tuple):
-        obs, info = result
-        print(f"env.reset() output: tuple, length={len(result)}")
-        print(f"Observation: type={type(obs)}, shape={obs.shape}, dtype={obs.dtype}")
-    else:
-        print(f"env.reset() output: {type(result)}, shape={result.shape}, dtype={result.dtype}")
-
-    policy_net = CategoricalDQN(
-        (args.num_stack, args.resize_shape, args.resize_shape, 1),
-        num_actions=env.action_space.n,
-        num_atoms=args.num_atoms,
-        V_min=args.V_min,
-        V_max=args.V_max,
-        std_init=args.std_init,
-        use_dueling=args.use_dueling
-    ).to(device)
-    
-    target_net = None
-    if args.use_double_dqn:
-        target_net = CategoricalDQN(
-            (args.num_stack, args.resize_shape, args.resize_shape, 1),
-            num_actions=env.action_space.n,
-            num_atoms=args.num_atoms,
-            V_min=args.V_min,
-            V_max=args.V_max,
-            std_init=args.std_init,
-            use_dueling=args.use_dueling
-        ).to(device)
-        target_net.load_state_dict(policy_net.state_dict())
-
-    start_steps = 0
-    start_episode = 0
-    warmup_done = False
-    if args.checkpoint_path:
-        start_steps, start_episode, warmup_done = load_checkpoint(policy_net, args.checkpoint_path, device)
-
-    optimizer = optim.Adam(policy_net.parameters(), lr=args.lr, eps=args.eps)
-    memory = SumTree(capacity=args.memory_capacity)
-
-    print("Starting training...")
-    policy_net, steps_done = train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=start_steps, start_episode=start_episode, warmup_done=warmup_done)
-    print("Training completed.")
-
-    print("Evaluating final model...")
-    evaluate_agent(env, policy_net, args, args.num_episodes, steps_done)
-    env.close()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
