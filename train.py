@@ -414,11 +414,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                     gc.collect()
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
-            # Ensure final cleanup
-            del next_state_tensor
-            gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+
         print("Warmup phase completed.")
     else:
         print("Warmup phase skipped (loaded from checkpoint).")
@@ -588,7 +584,8 @@ def evaluate_agent(env, policy_net, args, episode, steps_done):
     num_episodes = 10
     last_cpu_mem, last_gpu_mem = None, None
 
-    for ep in tqdm(range(num_episodes), desc="Evaluation Episodes"):
+    pbar = tqdm(range(num_episodes), desc="Evaluation Episodes")
+    for ep in pbar:
         policy_net.zero_noise()
         state, info = env.reset()
         state_tensor = torch.tensor(state, dtype=torch.float32, device=device) / 255.0
@@ -621,7 +618,7 @@ def evaluate_agent(env, policy_net, args, episode, steps_done):
             postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{last_cpu_mem:.2f}" if last_cpu_mem is not None else "N/A"}
             if last_gpu_mem != "N/A":
                 postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}" if last_gpu_mem is not None else "N/A"
-            tqdm.set_postfix(postfix)
+            pbar.set_postfix(postfix)
 
         # Ensure final cleanup per episode
         del next_state_tensor
@@ -632,7 +629,7 @@ def evaluate_agent(env, policy_net, args, episode, steps_done):
         postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{last_cpu_mem:.2f}"}
         if last_gpu_mem != "N/A":
             postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}"
-        tqdm.set_postfix(postfix)
+        pbar.set_postfix(postfix)
         total_reward += episode_reward
 
     avg_reward = total_reward / num_episodes
