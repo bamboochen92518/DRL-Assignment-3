@@ -16,8 +16,9 @@ import cv2
 import math
 from gym.wrappers import FrameStack
 import psutil  # For CPU memory usage
+import gc  # For garbage collection
 
-# SumTree (kept with uint8 storage)
+# SumTree (unchanged, kept on CPU with uint8 storage)
 class SumTree:
     def __init__(self, capacity):
         self.capacity = 1
@@ -255,7 +256,7 @@ class ResizeObservation(Wrapper):
             obs = np.expand_dims(obs, axis=-1)
         return obs
 
-# CategoricalDQN (reverted to original architecture)
+# CategoricalDQN (unchanged)
 class CategoricalDQN(nn.Module):
     def __init__(self, input_shape, num_actions=12, num_atoms=51, V_min=-10, V_max=10, std_init=0.5, use_dueling=False):
         super(CategoricalDQN, self).__init__()
@@ -324,7 +325,7 @@ class CategoricalDQN(nn.Module):
                 module.w_epsilon.zero_()
                 module.b_epsilon.zero_()
 
-# Transition and stack_data (kept with uint8 handling)
+# Transition and stack_data (unchanged)
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done', 'gamma'))
 
 def stack_data(batch_data, device='cpu', dtype=torch.float32):
@@ -341,20 +342,16 @@ def get_beta(step, total_steps, beta_start=0.4, beta_end=1.0):
     fraction = min(1.0, step / total_steps)
     return beta_start + fraction * (beta_end - beta_start)
 
-# Function to get memory usage
+# Function to get memory usage (unchanged)
 def get_memory_usage(device):
-    # CPU memory usage
     process = psutil.Process(os.getpid())
     cpu_mem = process.memory_info().rss / 1024 / 1024  # Convert to MB
-
-    # GPU memory usage (if available)
     gpu_mem = "N/A"
     if device.type == "cuda":
         gpu_mem = torch.cuda.memory_allocated(device) / 1024 / 1024  # Convert to MB
-
     return cpu_mem, gpu_mem
 
-# train_rainbow_dqn (updated with memory logging)
+# train_rainbow_dqn (updated to free memory)
 def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=0, start_episode=0, warmup_done=False):
     num_actions = env.action_space.n
     num_atoms = args.num_atoms
@@ -396,7 +393,6 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                 state = next_state
                 state_tensor = next_state_tensor
                 steps_done += 1
-                # Log memory usage
                 cpu_mem, gpu_mem = get_memory_usage(device)
                 postfix = {"CPU Mem (MB)": f"{cpu_mem:.2f}"}
                 if gpu_mem != "N/A":
@@ -406,6 +402,11 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                 if done:
                     state, info = env.reset()
                     state_tensor = torch.tensor(state, dtype=torch.float32, device=device) / 255.0
+                # Free memory
+                del next_state_tensor
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
         print("Warmup phase completed.")
     else:
         print("Warmup phase skipped (loaded from checkpoint).")
@@ -430,6 +431,8 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                             probs = policy_net(state_batched)
                             q_values = (probs * z).sum(dim=-1)
                         action = q_values.argmax(dim=1).item()
+                        # Free intermediate tensors
+                        del probs, q_values
                 next_state, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
                 next_state_tensor = torch.tensor(next_state, dtype=torch.float32, device=device) / 255.0
@@ -458,6 +461,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                             data[2] += (gamma ** (i + 1)) * _data[2]
                         batch_data.append(data)
 
+                    # Move batch to GPU
                     states = stack_data([data[0] for data in batch_data], device, torch.float32) / 255.0
                     actions = stack_data([data[1] for data in batch_data], device, torch.int64)
                     rewards = stack_data([data[2] for data in batch_data], device)
@@ -492,6 +496,8 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                             u_source = (target_probs * (b - l.float())).view(-1).float()
                             m_flat.index_add_(0, l_indices, l_source)
                             m_flat.index_add_(0, u_indices, u_source)
+                            # Free intermediate tensors
+                            del next_probs, next_q, next_action, target_probs, target_z, b, l, u, offset, l_clamped, u_clamped, m_flat, l_indices, u_indices, l_source, u_source
 
                     with torch.amp.autocast('cuda') if device.type == "cuda" else torch.no_grad():
                         probs = policy_net(states)[range(batch_size), actions]
@@ -499,6 +505,8 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                         weighted_loss = weights * loss
                         priorities = loss.detach().cpu().numpy() + 1e-5
                         loss = weighted_loss.mean()
+                        # Free intermediate tensors
+                        del probs, m, weighted_loss
 
                     optimizer.zero_grad()
                     if device.type == "cuda":
@@ -513,10 +521,15 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                     for idx, priority in zip(batch_idx, priorities):
                         memory.update_priority(idx, (priority ** args.alpha).item())
 
+                    # Free batch tensors
+                    del states, actions, rewards, next_states, dones, gammas, weights, loss, priorities
+                    gc.collect()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+
                 if use_double_dqn and steps_done % target_update == 0:
                     target_net.load_state_dict(policy_net.state_dict())
 
-                # Log memory usage after each step
                 cpu_mem, gpu_mem = get_memory_usage(device)
                 postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{cpu_mem:.2f}"}
                 if gpu_mem != "N/A":
@@ -542,7 +555,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
 
     return policy_net, steps_done
 
-# evaluate_agent (updated with memory logging)
+# evaluate_agent (updated to free memory)
 def evaluate_agent(env, policy_net, args, episode, steps_done):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_atoms = args.num_atoms
@@ -568,18 +581,26 @@ def evaluate_agent(env, policy_net, args, episode, steps_done):
                     probs = policy_net(state_batched)
                     q_values = (probs * z).sum(dim=-1)
                 action = q_values.argmax(dim=1).item()
+                # Free intermediate tensors
+                del probs, q_values
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-            state_tensor = torch.tensor(next_state, dtype=torch.float32, device=device) / 255.0
+            next_state_tensor = torch.tensor(next_state, dtype=torch.float32, device=device) / 255.0
+            state_tensor = next_state_tensor
             episode_reward += reward
             steps_in_episode += 1
 
-            # Log memory usage
             cpu_mem, gpu_mem = get_memory_usage(device)
             postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{cpu_mem:.2f}"}
             if gpu_mem != "N/A":
                 postfix["GPU Mem (MB)"] = f"{gpu_mem:.2f}"
             tqdm.set_postfix(postfix)
+
+            # Free memory
+            del next_state_tensor
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         total_reward += episode_reward
 
@@ -619,7 +640,7 @@ def load_checkpoint(model, checkpoint_path, device):
         print(f"Error loading checkpoint: {e}")
         raise
 
-# main (reverted parameters)
+# main (unchanged)
 def main():
     parser = argparse.ArgumentParser(description="Rainbow DQN for Super Mario Bros")
     parser.add_argument("--num_episodes", type=int, default=1000, help="Number of training episodes")
