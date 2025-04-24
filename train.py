@@ -15,6 +15,8 @@ from gym.wrappers import TimeLimit
 import argparse
 from tqdm import tqdm
 import psutil
+import lz4.frame
+import gc
 
 # Environment Wrappers
 class SkipFrame(gym.Wrapper):
@@ -143,30 +145,38 @@ class DuelingCNN(nn.Module):
         for m in [self.val_noisy, self.val, self.adv_noisy, self.adv]:
             m.reset_noise()
 
-# Replay Buffer
+# Replay Buffer with Compression
 class PrioritizedReplayBuffer:
     def __init__(self, cap, alpha, beta_start, beta_frames, n_step, gamma):
         self.cap, self.alpha = cap, alpha
         self.beta_start, self.beta_frames = beta_start, beta_frames
         self.beta_by_frame = lambda f: min(1.0, beta_start + f * (1.0 - beta_start) / beta_frames)
         self.n_step, self.gamma = n_step, gamma
-        self.buffer = []
-        self.prios = np.zeros((cap,), dtype=np.float32)
+        self.buffer = []  # Store compressed states
+        self.prios = np.zeros((cap,), dtype=np.float32)  # Use float32 to save memory
         self.pos = 0
         self.n_buf = deque(maxlen=n_step)
-        self.Exp = namedtuple('Exp', ['s', 'a', 'r', 's2', 'd'])
+        self.Exp = namedtuple('Exp', ['s', 'a', 'r', 's2', 'd'])  # Compressed s and s2
     def _get_n_step(self):
         r, s2, d = self.n_buf[-1].r, self.n_buf[-1].s2, self.n_buf[-1].d
+        s2 = np.frombuffer(lz4.frame.decompress(s2), dtype=np.float32).reshape(4, 84, 90)  # Decompress s2
         for trans in reversed(list(self.n_buf)[:-1]):
             r = trans.r + self.gamma * r * (1 - trans.d)
-            s2, d = (trans.s2, trans.d) if trans.d else (s2, d)
+            s2_decomp = np.frombuffer(lz4.frame.decompress(trans.s2), dtype=np.float32).reshape(4, 84, 90)
+            s2, d = (s2_decomp, trans.d) if trans.d else (s2, d)
         return r, s2, d
     def add(self, s, a, r, s2, d):
-        self.n_buf.append(self.Exp(s, a, r, s2, d))
+        self.n_buf.append(self.Exp(
+            lz4.frame.compress(s.tobytes()),  # Compress state
+            a,
+            np.float32(r),  # Use float32 for reward
+            lz4.frame.compress(s2.tobytes()),  # Compress next state
+            d
+        ))
         if len(self.n_buf) < self.n_step: return
         r_n, s2_n, d_n = self._get_n_step()
         s0, a0 = self.n_buf[0].s, self.n_buf[0].a
-        exp = self.Exp(s0, a0, r_n, s2_n, d_n)
+        exp = self.Exp(s0, a0, r_n, lz4.frame.compress(s2_n.tobytes()), d_n)
         if len(self.buffer) < self.cap:
             self.buffer.append(exp)
             prio = 1.0 if len(self.buffer) == 1 else self.prios.max()
@@ -183,10 +193,13 @@ class PrioritizedReplayBuffer:
         probs = prios / sum_p if sum_p > 0 else np.ones_like(prios) / N
         idxs = np.random.choice(N, bs, p=probs)
         batch = self.Exp(*zip(*[self.buffer[i] for i in idxs]))
+        # Decompress states
+        s = [np.frombuffer(lz4.frame.decompress(s_i), dtype=np.float32).reshape(4, 84, 90) for s_i in batch.s]
+        s2 = [np.frombuffer(lz4.frame.decompress(s2_i), dtype=np.float32).reshape(4, 84, 90) for s2_i in batch.s2]
         beta = self.beta_by_frame(frame_idx)
         weights = (N * probs[idxs]) ** (-beta)
         weights /= weights.max()
-        return (np.array(batch.s), batch.a, batch.r, np.array(batch.s2), batch.d, weights.astype(np.float32), idxs)
+        return (np.array(s), batch.a, batch.r, np.array(s2), batch.d, weights.astype(np.float32), idxs)
     def update_priorities(self, idxs, errors):
         for i, e in zip(idxs, errors):
             self.prios[i] = abs(e) + 1e-6
@@ -215,7 +228,9 @@ class Agent:
         s_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
         with torch.no_grad():
             q = self.online(s_t)
-        return int(q.argmax(1).item())
+        a = int(q.argmax(1).item())
+        del s_t, q  # Free memory
+        return a
     def push(self, s, a, r, s2, d):
         self.buffer.add(s, a, r, s2, d)
     def learn(self):
@@ -255,6 +270,9 @@ class Agent:
         self.icm_opt.step()
         if self.frame_idx % self.args.copy_network_freq == 0:
             self.target.load_state_dict(self.online.state_dict())
+        # Free memory
+        del s, s2, a, d, w, r_ext, feat, nxt_feat, feat_icm, nxt_feat_icm, logits, pred_phi_n, true_phi_n
+        del int_r, q_pred, a_n, q_next, total_r, q_tar, td, dqn_loss, icm_loss
 
 # Utility Function for Memory Usage
 def get_memory_usage(device):
@@ -337,6 +355,8 @@ def train(args, checkpoint_path='checkpoints/rainbow_icm.pth'):
                 if last_gpu_mem != "N/A":
                     postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}" if last_gpu_mem is not None else "N/A"
                 pbar.set_postfix(**postfix)
+                if steps_in_episode % 50 == 0:
+                    gc.collect()  # Periodic garbage collection
             hist['reward'].append(ep_r)
             hist['env_reward'].append(ep_er)
             hist['stage'].append(env.unwrapped._stage)
@@ -380,6 +400,8 @@ def train(args, checkpoint_path='checkpoints/rainbow_icm.pth'):
                             if last_gpu_mem != "N/A":
                                 postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}" if last_gpu_mem is not None else "N/A"
                             eval_bar.set_postfix(**postfix)
+                            if step % 50 == 0:
+                                gc.collect()  # Periodic garbage collection
                         eval_rewards.append(total)
                 eval_env.close()
                 print(f"Evaluation at Episode {ep}: Avg Reward over 10 eps: {np.mean(eval_rewards):.2f}")
@@ -390,6 +412,7 @@ def train(args, checkpoint_path='checkpoints/rainbow_icm.pth'):
                     'frame_idx': agent.frame_idx,
                     'episode': ep
                 }, checkpoint_path)
+                gc.collect()  # Garbage collection after evaluation
     print("Training complete.")
     return hist
 
