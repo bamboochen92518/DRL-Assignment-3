@@ -15,10 +15,10 @@ import argparse
 import cv2
 import math
 from gym.wrappers import FrameStack
-import psutil  # For CPU memory usage
-import gc  # For garbage collection
+import psutil
+import gc
 
-# SumTree (unchanged, kept on CPU with uint8 storage)
+# SumTree (unchanged)
 class SumTree:
     def __init__(self, capacity):
         self.capacity = 1
@@ -50,10 +50,10 @@ class SumTree:
         leaf_real_idx = self.leaf_idx_offset + self.tree_leaf_pos
         state, action, reward, next_state, done = data
         self.dataset[leaf_real_idx] = (
-            state,  # Already uint8
+            state,
             np.int16(action),
             float(reward),
-            next_state,  # Already uint8
+            next_state,
             bool(done)
         )
 
@@ -345,13 +345,13 @@ def get_beta(step, total_steps, beta_start=0.4, beta_end=1.0):
 # Function to get memory usage (unchanged)
 def get_memory_usage(device):
     process = psutil.Process(os.getpid())
-    cpu_mem = process.memory_info().rss / 1024 / 1024  # Convert to MB
+    cpu_mem = process.memory_info().rss / 1024 / 1024
     gpu_mem = "N/A"
     if device.type == "cuda":
-        gpu_mem = torch.cuda.memory_allocated(device) / 1024 / 1024  # Convert to MB
+        gpu_mem = torch.cuda.memory_allocated(device) / 1024 / 1024
     return cpu_mem, gpu_mem
 
-# train_rainbow_dqn (updated to free memory)
+# train_rainbow_dqn (optimized memory management frequency)
 def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, start_steps=0, start_episode=0, warmup_done=False):
     num_actions = env.action_space.n
     num_atoms = args.num_atoms
@@ -372,6 +372,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
     epsilon_end = 0.1
     epsilon_decay = args.total_steps // 2
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    last_cpu_mem, last_gpu_mem = None, None
 
     def get_epsilon(step):
         fraction = min(1.0, step / epsilon_decay)
@@ -379,7 +380,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
 
     if not warmup_done:
         print("Starting warmup phase...")
-        state, info = env.reset()  # uint8
+        state, info = env.reset()
         state_tensor = torch.tensor(state, dtype=torch.float32, device=device) / 255.0
         with tqdm(total=warmup_steps, desc="Warmup Steps") as pbar:
             while steps_done < warmup_steps:
@@ -393,20 +394,31 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                 state = next_state
                 state_tensor = next_state_tensor
                 steps_done += 1
-                cpu_mem, gpu_mem = get_memory_usage(device)
-                postfix = {"CPU Mem (MB)": f"{cpu_mem:.2f}"}
-                if gpu_mem != "N/A":
-                    postfix["GPU Mem (MB)"] = f"{gpu_mem:.2f}"
+
+                # Update memory stats less frequently
+                if steps_done % 10 == 0:
+                    last_cpu_mem, last_gpu_mem = get_memory_usage(device)
+                postfix = {"CPU Mem (MB)": f"{last_cpu_mem:.2f}" if last_cpu_mem is not None else "N/A"}
+                if last_gpu_mem != "N/A":
+                    postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}" if last_gpu_mem is not None else "N/A"
                 pbar.set_postfix(postfix)
                 pbar.update(1)
+
                 if done:
                     state, info = env.reset()
                     state_tensor = torch.tensor(state, dtype=torch.float32, device=device) / 255.0
-                # Free memory
-                del next_state_tensor
-                gc.collect()
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+
+                # Free memory less frequently
+                if steps_done % 100 == 0:
+                    del next_state_tensor
+                    gc.collect()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+            # Ensure final cleanup
+            del next_state_tensor
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         print("Warmup phase completed.")
     else:
         print("Warmup phase skipped (loaded from checkpoint).")
@@ -431,7 +443,6 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                             probs = policy_net(state_batched)
                             q_values = (probs * z).sum(dim=-1)
                         action = q_values.argmax(dim=1).item()
-                        # Free intermediate tensors
                         del probs, q_values
                 next_state, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
@@ -461,7 +472,6 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                             data[2] += (gamma ** (i + 1)) * _data[2]
                         batch_data.append(data)
 
-                    # Move batch to GPU
                     states = stack_data([data[0] for data in batch_data], device, torch.float32) / 255.0
                     actions = stack_data([data[1] for data in batch_data], device, torch.int64)
                     rewards = stack_data([data[2] for data in batch_data], device)
@@ -496,7 +506,6 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                             u_source = (target_probs * (b - l.float())).view(-1).float()
                             m_flat.index_add_(0, l_indices, l_source)
                             m_flat.index_add_(0, u_indices, u_source)
-                            # Free intermediate tensors
                             del next_probs, next_q, next_action, target_probs, target_z, b, l, u, offset, l_clamped, u_clamped, m_flat, l_indices, u_indices, l_source, u_source
 
                     with torch.amp.autocast('cuda') if device.type == "cuda" else torch.no_grad():
@@ -505,7 +514,6 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                         weighted_loss = weights * loss
                         priorities = loss.detach().cpu().numpy() + 1e-5
                         loss = weighted_loss.mean()
-                        # Free intermediate tensors
                         del probs, m, weighted_loss
 
                     optimizer.zero_grad()
@@ -521,20 +529,32 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
                     for idx, priority in zip(batch_idx, priorities):
                         memory.update_priority(idx, (priority ** args.alpha).item())
 
-                    # Free batch tensors
                     del states, actions, rewards, next_states, dones, gammas, weights, loss, priorities
-                    gc.collect()
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
 
                 if use_double_dqn and steps_done % target_update == 0:
                     target_net.load_state_dict(policy_net.state_dict())
 
-                cpu_mem, gpu_mem = get_memory_usage(device)
-                postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{cpu_mem:.2f}"}
-                if gpu_mem != "N/A":
-                    postfix["GPU Mem (MB)"] = f"{gpu_mem:.2f}"
+                # Free memory and update memory stats less frequently
+                if steps_in_episode % 50 == 0:
+                    gc.collect()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                if steps_in_episode % 10 == 0:
+                    last_cpu_mem, last_gpu_mem = get_memory_usage(device)
+                postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{last_cpu_mem:.2f}" if last_cpu_mem is not None else "N/A"}
+                if last_gpu_mem != "N/A":
+                    postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}" if last_gpu_mem is not None else "N/A"
                 pbar.set_postfix(postfix)
+
+            # Ensure final cleanup per episode
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            last_cpu_mem, last_gpu_mem = get_memory_usage(device)
+            postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{last_cpu_mem:.2f}"}
+            if last_gpu_mem != "N/A":
+                postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}"
+            pbar.set_postfix(postfix)
 
             history_rewards.append(episode_reward)
             if (episode + 1) % args.checkpoint_interval == 0:
@@ -555,7 +575,7 @@ def train_rainbow_dqn(env, policy_net, target_net, optimizer, memory, args, star
 
     return policy_net, steps_done
 
-# evaluate_agent (updated to free memory)
+# evaluate_agent (optimized memory management frequency)
 def evaluate_agent(env, policy_net, args, episode, steps_done):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_atoms = args.num_atoms
@@ -566,6 +586,7 @@ def evaluate_agent(env, policy_net, args, episode, steps_done):
     policy_net.eval()
     total_reward = 0
     num_episodes = 10
+    last_cpu_mem, last_gpu_mem = None, None
 
     for ep in tqdm(range(num_episodes), desc="Evaluation Episodes"):
         policy_net.zero_noise()
@@ -581,7 +602,6 @@ def evaluate_agent(env, policy_net, args, episode, steps_done):
                     probs = policy_net(state_batched)
                     q_values = (probs * z).sum(dim=-1)
                 action = q_values.argmax(dim=1).item()
-                # Free intermediate tensors
                 del probs, q_values
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
@@ -590,18 +610,29 @@ def evaluate_agent(env, policy_net, args, episode, steps_done):
             episode_reward += reward
             steps_in_episode += 1
 
-            cpu_mem, gpu_mem = get_memory_usage(device)
-            postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{cpu_mem:.2f}"}
-            if gpu_mem != "N/A":
-                postfix["GPU Mem (MB)"] = f"{gpu_mem:.2f}"
+            # Free memory and update memory stats less frequently
+            if steps_in_episode % 50 == 0:
+                del next_state_tensor
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            if steps_in_episode % 10 == 0:
+                last_cpu_mem, last_gpu_mem = get_memory_usage(device)
+            postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{last_cpu_mem:.2f}" if last_cpu_mem is not None else "N/A"}
+            if last_gpu_mem != "N/A":
+                postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}" if last_gpu_mem is not None else "N/A"
             tqdm.set_postfix(postfix)
 
-            # Free memory
-            del next_state_tensor
-            gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
+        # Ensure final cleanup per episode
+        del next_state_tensor
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        last_cpu_mem, last_gpu_mem = get_memory_usage(device)
+        postfix = {"Reward": f"{episode_reward:.2f}", "Steps": steps_in_episode, "CPU Mem (MB)": f"{last_cpu_mem:.2f}"}
+        if last_gpu_mem != "N/A":
+            postfix["GPU Mem (MB)"] = f"{last_gpu_mem:.2f}"
+        tqdm.set_postfix(postfix)
         total_reward += episode_reward
 
     avg_reward = total_reward / num_episodes
@@ -644,18 +675,18 @@ def load_checkpoint(model, checkpoint_path, device):
 def main():
     parser = argparse.ArgumentParser(description="Rainbow DQN for Super Mario Bros")
     parser.add_argument("--num_episodes", type=int, default=1000, help="Number of training episodes")
-    parser.add_argument("--warmup_steps", type=int, default=80000, help="Number of warmup steps")
+    parser.add_argument("--warmup_steps", type=int, default=10000, help="Number of warmup steps")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--gamma", type=float, default=0.9, help="Discount factor")
     parser.add_argument("--n_step", type=int, default=3, help="N-step return")
-    parser.add_argument("--target_update", type=int, default=32000, help="Steps between target network updates")
+    parser.add_argument("--target_update", type=int, default=10000, help="Steps between target network updates")
     parser.add_argument("--num_atoms", type=int, default=51, help="Number of atoms in categorical DQN")
     parser.add_argument("--V_min", type=float, default=-10, help="Minimum value for categorical DQN")
     parser.add_argument("--V_max", type=float, default=10, help="Maximum value for categorical DQN")
-    parser.add_argument("--lr", type=float, default=6.25e-5, help="Learning rate for Adam optimizer")
+    parser.add_argument("--lr", type=float, default=2.5e-4, help="Learning rate for Adam optimizer")
     parser.add_argument("--eps", type=float, default=1.5e-4, help="Epsilon for Adam optimizer")
-    parser.add_argument("--memory_capacity", type=int, default=100000, help="Replay buffer capacity")
-    parser.add_argument("--alpha", type=float, default=0.5, help="Prioritized replay alpha")
+    parser.add_argument("--memory_capacity", type=int, default=10000, help="Replay buffer capacity")
+    parser.add_argument("--alpha", type=float, default=0.6, help="Prioritized replay alpha")
     parser.add_argument("--beta", type=float, default=0.4, help="Initial prioritized replay beta")
     parser.add_argument("--num_eval_episodes", type=int, default=5, help="Number of evaluation episodes")
     parser.add_argument("--resize_shape", type=int, default=84, help="Size for resizing observations")
