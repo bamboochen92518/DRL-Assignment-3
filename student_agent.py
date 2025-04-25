@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 from collections import deque
 from torchvision import transforms as T
+import gc
 
 # Import DuelingCNN, NoisyLinear, and COMPLEX_MOVEMENT from train.py
 from train import DuelingCNN, NoisyLinear, COMPLEX_MOVEMENT
@@ -12,7 +13,7 @@ from train import DuelingCNN, NoisyLinear, COMPLEX_MOVEMENT
 # Define constants (adjust these to match train.py if needed)
 CHECKPOINT_PATH = 'checkpoints/rainbow_icm.pth'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-SKIP_FRAMES = 4  # Adjust this to match train.py's SkipFrame wrapper
+SKIP_FRAMES = 4  # Matches train.py's args.skip_frames
 
 # Agent class with checkpoint loading and preprocessing
 class Agent(object):
@@ -36,10 +37,10 @@ class Agent(object):
 
         # Preprocessing transform (grayscale and resize)
         self.transform = T.Compose([
-            T.ToPILImage(),  # Convert numpy array to PIL Image
-            T.Grayscale(),   # Convert to grayscale
-            T.Resize((84, 90)),  # Resize to 84x90
-            T.ToTensor()     # Convert to tensor (1, 84, 90)
+            T.ToPILImage(),
+            T.Grayscale(),
+            T.Resize((84, 90)),
+            T.ToTensor()
         ])
 
         # Frame stack to maintain 4 frames
@@ -51,7 +52,13 @@ class Agent(object):
         self.skip_count = 0
         self.last_action = 0
 
+        # Step counter for periodic garbage collection
+        self.step_counter = 0
+
     def act(self, observation):
+        # Increment step counter for garbage collection
+        self.step_counter += 1
+
         # Ensure the observation is in the correct format
         observation = np.ascontiguousarray(observation)  # Fix negative strides
         if observation.shape != (240, 256, 3):  # Expected raw shape
@@ -91,6 +98,10 @@ class Agent(object):
         # Clean up to save memory
         del obs_tensor, q_values, processed_frame, stacked_frames
 
+        # Periodic garbage collection (every 50 steps, matching train.py)
+        if self.step_counter % 50 == 0:
+            gc.collect()
+
         return action
 
     def reset(self):
@@ -98,3 +109,4 @@ class Agent(object):
         self.first = True
         self.skip_count = 0
         self.last_action = 0
+        self.step_counter = 0
