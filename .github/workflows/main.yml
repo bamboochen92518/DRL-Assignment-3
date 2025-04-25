@@ -28,6 +28,8 @@ jobs:
         pip install gym
         pip install -r requirements.txt
         pip install gdown
+        pip install psutil
+        pip install lz4
         gdown --fuzzy "https://drive.google.com/file/d/1RaBbTNZ_xNWP4fTlWOE58X3I9eu-N2m7/view?usp=sharing"
         mkdir checkpoints
         mv rainbow_icm.pth checkpoints/
