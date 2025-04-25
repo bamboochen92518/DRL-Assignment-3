@@ -29,6 +29,9 @@ class Agent(object):
             print("Using randomly initialized model instead.")
 
     def act(self, observation):
+        # Ensure the observation has a contiguous layout with positive strides
+        observation = np.ascontiguousarray(observation)
+        
         # Convert observation to tensor and move to device
         obs_tensor = torch.tensor(observation, dtype=torch.float32).unsqueeze(0).to(self.device)
         
