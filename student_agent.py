@@ -4,67 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-# Noisy Linear Layer (copied from training script)
-class NoisyLinear(nn.Module):
-    def __init__(self, in_f, out_f, sigma_init):
-        super().__init__()
-        self.in_f, self.out_f = in_f, out_f
-        self.weight_mu = nn.Parameter(torch.empty(out_f, in_f))
-        self.weight_sigma = nn.Parameter(torch.empty(out_f, in_f))
-        self.register_buffer('weight_epsilon', torch.empty(out_f, in_f))
-        self.bias_mu = nn.Parameter(torch.empty(out_f))
-        self.bias_sigma = nn.Parameter(torch.empty(out_f))
-        self.register_buffer('bias_epsilon', torch.empty(out_f))
-        self.sigma_init = sigma_init
-        self.reset_parameters()
-        self.reset_noise()
-    def reset_parameters(self):
-        bound = 1 / (self.in_f**0.5)
-        nn.init.uniform_(self.weight_mu, -bound, bound)
-        nn.init.constant_(self.weight_sigma, self.sigma_init / (self.in_f**0.5))
-        nn.init.uniform_(self.bias_mu, -bound, bound)
-        nn.init.constant_(self.bias_sigma, self.sigma_init / (self.out_f**0.5))
-    def reset_noise(self):
-        f = lambda x: x.sign() * x.abs().sqrt()
-        eps_in = f(torch.randn(self.in_f))
-        eps_out = f(torch.randn(self.out_f))
-        self.weight_epsilon.copy_(eps_out.ger(eps_in))
-        self.bias_epsilon.copy_(eps_out)
-    def forward(self, x):
-        if self.training:
-            w = self.weight_mu + self.weight_sigma * self.weight_epsilon
-            b = self.bias_mu + self.bias_sigma * self.bias_epsilon
-        else:
-            w, b = self.weight_mu, self.bias_mu
-        return F.linear(x, w, b)
-
-# Dueling CNN (copied from training script)
-class DuelingCNN(nn.Module):
-    def __init__(self, in_c, n_actions, noisy_sigma_init):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(in_c, 32, 8, 4), nn.ReLU(),
-            nn.Conv2d(32, 64, 4, 2), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, 1), nn.ReLU(),
-            nn.Flatten()
-        )
-        with torch.no_grad():
-            dummy = torch.zeros(1, in_c, 84, 90)
-            feat_dim = self.features(dummy).shape[1]
-        self.val_noisy = NoisyLinear(feat_dim, 512, sigma_init=noisy_sigma_init)
-        self.val = NoisyLinear(512, 1, sigma_init=noisy_sigma_init)
-        self.adv_noisy = NoisyLinear(feat_dim, 512, sigma_init=noisy_sigma_init)
-        self.adv = NoisyLinear(512, n_actions, sigma_init=noisy_sigma_init)
-    def forward(self, x):
-        x = self.features(x / 255.0)
-        v = F.relu(self.val_noisy(x))
-        v = self.val(v)
-        a = F.relu(self.adv_noisy(x))
-        a = self.adv(a)
-        return v + (a - a.mean(dim=1, keepdim=True))
-    def reset_noise(self):
-        for m in [self.val_noisy, self.val, self.adv_noisy, self.adv]:
-            m.reset_noise()
+# Import DuelingCNN and NoisyLinear from train.py
+from train import DuelingCNN, NoisyLinear
 
 # Agent class with checkpoint loading
 class Agent(object):
